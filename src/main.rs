@@ -16,6 +16,7 @@ mod leds;
 mod net;
 mod portal;
 mod util;
+mod vitrina;
 
 use leds::{Led, Leds, BLUE, GREEN, RED};
 use std::sync::{Arc, Mutex};
