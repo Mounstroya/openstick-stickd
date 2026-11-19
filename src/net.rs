@@ -18,7 +18,7 @@ pub fn laptop_ip() -> Option<String> {
     let mac = laptop_mac();
     let (_, out) = run("ip", &["neigh", "show", "dev", "usb0"]);
     out.lines()
-        .find(|l| l.contains(&mac) && !l.contains("FAILED") && !l.contains("INCOMPLETE"))
+        .find(|l| l.starts_with("192.168.5.") && l.contains(&mac) && !l.contains("FAILED") && !l.contains("INCOMPLETE"))
         .and_then(|l| l.split_whitespace().next().map(String::from))
         .or_else(|| {
             // la laptop pudo no haber hablado aún: un ping a broadcast llena la tabla

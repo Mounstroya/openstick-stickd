@@ -128,7 +128,8 @@ fn handle_post(state: &Arc<Mutex<State>>, vit: &Vitrinas, path: &str, f: &[(Stri
                 save_mode(m);
                 let mut s = state.lock().unwrap();
                 s.mode = m;
-                s.request = Some(Request::ApplyMode);
+                // si está en configuración, salir primero (al salir se aplica el modo nuevo)
+                s.request = Some(if s.config_mode { Request::ExitConfig } else { Request::ApplyMode });
                 format!("Modo cambiado a «{}».", html(&mode_label(m, vit)))
             }
             None => "Modo no válido.".into(),
