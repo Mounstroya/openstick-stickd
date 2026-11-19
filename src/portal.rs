@@ -262,6 +262,13 @@ fn salida_humana(uplink: &str, sharing: bool) -> String {
 }
 
 fn page(state: &Arc<Mutex<State>>, vit: &Vitrinas, msg: &str, abrir: Option<&str>) -> Response<std::io::Cursor<Vec<u8>>> {
+    let html_page = page_html(state, vit, msg, abrir, &net::saved_wifis());
+    Response::from_string(html_page).with_header(hdr("Content-Type", "text/html; charset=utf-8"))
+}
+
+/// HTML del panel. No consulta el sistema: las redes guardadas (`saved`: conexión NM, SSID)
+/// llegan como parámetro (así se puede pintar con datos simulados, ver src/capturas.rs).
+pub(crate) fn page_html(state: &Arc<Mutex<State>>, vit: &Vitrinas, msg: &str, abrir: Option<&str>, saved: &[(String, String)]) -> String {
     let (mode, cfg, scan, pb) = {
         let s = state.lock().unwrap();
         (s.mode, s.config_mode, s.scan.clone(), s.powerbank)
@@ -314,7 +321,7 @@ fn page(state: &Arc<Mutex<State>>, vit: &Vitrinas, msg: &str, abrir: Option<&str
         );
     }
     let lado = if matches!(mode, Mode::Vitrina(_)) { "vit" } else { "con" };
-    let saved: String = net::saved_wifis()
+    let saved: String = saved
         .iter()
         .map(|(n, ssid)| {
             format!(
@@ -328,7 +335,7 @@ fn page(state: &Arc<Mutex<State>>, vit: &Vitrinas, msg: &str, abrir: Option<&str
         .iter()
         .map(|(s, sig, sec)| format!("<option value=\"{0}\">{0} — señal {1}% {2}</option>", html(s), sig, html(sec)))
         .collect();
-    let html_page = format!(
+    format!(
         r#"<!doctype html><html lang=es><head><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1">
 <meta name=color-scheme content="light dark"><title>OpenStick</title><style>
 :root{{--bg:#0f1115;--card:#181b22;--soft:#222631;--tx:#e8eaf0;--mut:#9aa0ae;--ac:#6aa0ff;--acb:#2f6fe4;--badb:#c93636;--ok:#3ecf8e;--bad:#ff6b6b;--bd:#ffffff2a}}
@@ -418,8 +425,7 @@ f();setInterval(f,5000);
         saved = if saved.is_empty() { "<li>Ninguna guardada</li>".into() } else { saved },
         accion = if cfg { "salir" } else { "entrar" },
         accion_txt = if cfg { "Salir de configuración" } else { "Entrar a configuración" },
-    );
-    Response::from_string(html_page).with_header(hdr("Content-Type", "text/html; charset=utf-8"))
+    )
 }
 
 #[cfg(test)]

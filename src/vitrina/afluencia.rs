@@ -1032,6 +1032,25 @@ impl Vitrina for Afluencia {
 
 // ---------------------------------------------------------------------------------------
 
+/// Solo para las capturas de pantalla (src/capturas.rs): finge que la captura está corriendo
+/// (sin tocar el radio) y registra estos probe requests en la ventana actual.
+#[cfg(test)]
+impl Afluencia {
+    pub(crate) fn simular_captura(&self, canal: u8, probes: &[Probe], tramas: u64, beacons: u64) {
+        let mut s = self.inner.st.lock().unwrap();
+        s.activo = true;
+        s.error.clear();
+        s.diag.canal = canal;
+        s.diag.tramas = tramas;
+        s.diag.mgmt[4] = probes.len() as u64;
+        s.diag.mgmt[8] = beacons;
+        s.diag.otras = tramas.saturating_sub(probes.len() as u64 + beacons);
+        for p in probes {
+            s.registrar(p);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

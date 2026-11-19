@@ -830,6 +830,30 @@ pub fn guardar_config(n: Config) {
     }
 }
 
+/// Solo para las capturas de pantalla (src/capturas.rs): pone un estado simulado sin tocar nft
+/// ni /etc/stickd. `accesos`: (ip, nombre, MAC, minutos que quedan, bytes usados).
+#[cfg(test)]
+pub fn simular(cfg: Config, salida_dev: &str, accesos: &[(Ipv4Addr, &str, &str, u64, u64)]) {
+    let ahora = Instant::now();
+    let mut s = e();
+    s.cfg = cfg;
+    s.ap = true;
+    s.salida = true;
+    s.salida_dev = salida_dev.to_string();
+    s.accesos = accesos
+        .iter()
+        .map(|&(ip, nombre, mac, min, bytes)| Acceso {
+            ip,
+            mac: mac.into(),
+            nombre: nombre.into(),
+            hasta: ahora + Duration::from_secs(min * 60 + 17),
+            bytes_previos: bytes,
+            bytes_nft: 0,
+        })
+        .collect();
+    s.usados = accesos.iter().map(|a| (a.0.to_string(), ahora)).collect();
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

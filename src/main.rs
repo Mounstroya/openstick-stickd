@@ -18,6 +18,8 @@
 //!       azul  = fijo: internet por USB o WiFi · latido: internet por LTE · destello corto: sin internet
 
 mod button;
+#[cfg(test)]
+mod capturas;
 mod captive;
 mod invitados;
 mod leds;

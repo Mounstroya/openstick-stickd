@@ -46,6 +46,8 @@ connects sees a page right away:
 | **File sharing** | AirDrop-style transfers between any phones/PCs over **WebRTC, peer to peer**; the stick only does signaling |
 | **Foot traffic** | Estimates nearby phones from Wi-Fi probe requests, with MACs anonymized |
 
+See the [screenshots](#screenshots) of every page.
+
 Any showcase can **start automatically when the stick is on a power bank**. It detects that no
 computer is attached to its USB port.
 
@@ -56,6 +58,35 @@ access through the stick's uplink. They are isolated from private networks.
 ### Hardware
 - **LEDs**: red = power; green = Wi-Fi / setup / showcase; blue = internet via USB, Wi-Fi or LTE
 - **Button** (pinhole): short press toggles setup mode; holding it 8 s reboots
+
+## Screenshots
+
+All screenshots use simulated data (the person, phone number, email and networks are
+placeholders). The UI is in Spanish. Phone screenshots are 390 px wide, in dark mode.
+
+**What visitors see** after joining the showcase Wi-Fi:
+
+| | | |
+|:---:|:---:|:---:|
+| <img src="docs/screenshots/portfolio.png" width="250" alt="Portfolio showcase"><br>**Portfolio**: an uploaded site | <img src="docs/screenshots/portfolio-link.png" width="250" alt="Portfolio link page"><br>**Portfolio** with only a link: QR + copy button | <img src="docs/screenshots/card.png" width="250" alt="Business card"><br>**Business card** with "Save contact" |
+| <img src="docs/screenshots/mailbox.png" width="250" alt="Offline mailbox"><br>**Offline mailbox** with the public wall | <img src="docs/screenshots/chat.png" width="250" alt="Local chat"><br>**Local chat**, with the host's messages highlighted | <img src="docs/screenshots/share.png" width="250" alt="File sharing home"><br>**File sharing**: send or receive |
+| <img src="docs/screenshots/share-send.png" width="250" alt="File sharing, sender"><br>Sender: a code that is easy to say out loud, plus a QR | <img src="docs/screenshots/share-transfer.png" width="250" alt="File sharing, receiving"><br>Receiver during a real WebRTC transfer | <img src="docs/screenshots/share-iphone.png" width="250" alt="iOS captive portal notice"><br>In the iOS captive-portal window: how to get to Safari |
+| <img src="docs/screenshots/guest-internet.png" width="250" alt="Guest internet"><br>**Guest internet**: the terms shown before access is granted | <img src="docs/screenshots/card-light.png" width="250" alt="Business card, light mode"><br>Pages follow the phone's theme (light) | <img src="docs/screenshots/card.png" width="250" alt="Business card, dark mode"><br>…and dark |
+
+The blue "Continue with internet" bar at the bottom of each page appears only when
+[guest internet](#guest-internet-optional) is on.
+
+**Admin panel** (`portal.rs`), reachable over USB or from the setup hotspot:
+
+<img src="docs/screenshots/admin-desktop.png" width="820" alt="Admin panel, status and work mode">
+
+| | | |
+|:---:|:---:|:---:|
+| <img src="docs/screenshots/admin-phone.png" width="250" alt="Admin panel on a phone"><br>On a phone | <img src="docs/screenshots/admin-guests.png" width="250" alt="Guest internet settings"><br>Guest internet settings and active devices | <img src="docs/screenshots/admin-traffic.png" width="250" alt="Foot traffic"><br>Foot traffic: now, today and the last 24 h |
+
+To regenerate them, run `docs/screenshots/capture.sh`. It needs Chromium and
+`puppeteer-core`. It starts a local server with simulated data (`src/capturas.rs`, compiled
+only for tests) and takes the screenshots with headless Chromium.
 
 ## Building
 
