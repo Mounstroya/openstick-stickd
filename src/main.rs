@@ -10,6 +10,8 @@
 //! Vitrinas (src/vitrina/): el stick crea su PROPIO WiFi abierto y atiende a quien se conecta
 //! (portafolio, tarjeta, buzón) o usa el radio en monitor (afluencia). Se eligen en el panel, y
 //! una de ellas puede arrancar sola cuando el stick está en una powerbank (sin PC en el USB).
+//! Opcional: "internet para invitados" (src/invitados.rs) da internet limitado a quien lo pide
+//! desde la vitrina, por la salida que haya (USB o LTE).
 //!
 //! LEDs: rojo = encendido (parpadea rápido mientras mantienes el botón)
 //!       verde = fijo: conectado a WiFi · parpadeo lento: configuración · latido: vitrina
@@ -17,6 +19,7 @@
 
 mod button;
 mod captive;
+mod invitados;
 mod leds;
 mod net;
 mod portal;
@@ -277,6 +280,7 @@ fn main() {
     button::spawn(state.clone());
     portal::spawn(state.clone(), vit.clone(), activa.clone());
     captive::spawn(vit.clone(), activa.clone());
+    invitados::spawn();
 
     let mut leds = Leds::new();
     let mut applied: Option<Mode> = None;
@@ -366,6 +370,8 @@ fn main() {
 
         let internet = net::internet();
         let uplink = net::uplink_dev().unwrap_or_default();
+        // salida para los invitados de una vitrina: USB o LTE (el WiFi es el AP)
+        invitados::set_salida(internet && !uplink.is_empty() && uplink != "wlan0" && uplink != "wg0", &uplink);
 
         // 4. Configuración automática si no hay internet (no en vitrina: ahí es normal)
         if internet || matches!(eff, Mode::Vitrina(_)) {

@@ -6,6 +6,10 @@
 //!     teléfono abra la página solo
 //!   - enrutar cada petición de invitado al módulo activo (`guest`)
 //!   - mostrar la sección de cada módulo en el panel de administración (`admin_html` / `admin_post`)
+//!   - "internet para invitados" (src/invitados.rs): la ruta `/_stick/internet` es del núcleo (nunca
+//!     llega al módulo) y a las respuestas `text/html` 200 de un GET se les inyecta una barra antes
+//!     de `</body>`. Un módulo puede evitarla en una respuesta con el header `X-Stick-Barra: no`.
+//!     `crate::captive::cliente_tiene_internet(ip)` dice si ese invitado ya tiene internet.
 //!
 //! Cada módulo vive en su propio archivo y SOLO implementa el trait `Vitrina`.
 //! Datos persistentes de cada módulo: `data_dir(id)` = /var/lib/stickd/<id>/ (ya creada).

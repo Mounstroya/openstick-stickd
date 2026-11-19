@@ -3,8 +3,11 @@
 //!   - servidor HTTP de invitados en :8080 que atiende las URLs de detección y pasa el resto
 //!     al módulo activo
 //!   - reglas nft (tabla inet stickd_captive) SOLO sobre wlan0: DNS→5353, HTTP→8080, y todo
-//!     lo demás bloqueado (sin SSH, sin panel de admin, sin reenvío a internet)
+//!     lo demás bloqueado (sin SSH, sin panel de admin, sin reenvío a internet), salvo los
+//!     invitados con internet concedido (ver invitados.rs): ellos salen a internet, nunca a
+//!     redes privadas ni a puertos del stick que no sean los del portal
 
+use crate::invitados;
 use crate::util::{log, run};
 use crate::vitrina::{GuestReq, GuestResp, Vitrina};
 use std::io::Read;
@@ -19,44 +22,86 @@ const DNS_PORT: u16 = 5353;
 /// Índice del módulo activo en el vector de vitrinas (None = ninguna vitrina con AP activa).
 pub type Activa = Arc<Mutex<Option<usize>>>;
 
-const NFT: &str = r#"table inet stickd_captive
-delete table inet stickd_captive
-table inet stickd_captive {
-  chain entrada_nat {
+/// Reglas del portal. `ap` = interfaces del AP; `elementos` = invitados con internet (ip, s).
+pub fn nft_reglas(ap: &[String], cfg: &invitados::Config, elementos: &[(std::net::Ipv4Addr, u64)]) -> String {
+    let lista = ap.iter().map(|i| format!("\"{i}\"")).collect::<Vec<_>>().join(", ");
+    let ap_set = format!("{{ {lista} }}");
+    let els = if elementos.is_empty() {
+        String::new()
+    } else {
+        let v: Vec<String> = elementos.iter().map(|(ip, t)| format!("{ip} timeout {t}s")).collect();
+        format!(" elements = {{ {} }};", v.join(", "))
+    };
+    let lim = |set: &str, campo: &str, mbps: f64| match invitados::Config::bps(mbps) {
+        // policía por IP: este kernel no trae HTB/TBF/ingress. Ráfaga = medio segundo.
+        Some(b) => format!("    update @{set} {{ ip {campo} limit rate over {b} bytes/second burst {} bytes }} drop\n", (b / 2).max(16_000)),
+        None => String::new(),
+    };
+    let (t, s, m, dns, priv_) = (invitados::TABLA, invitados::SET, invitados::MARCA, invitados::DNS_REAL, invitados::PRIVADAS);
+    format!(
+        r#"table inet {t}
+delete table inet {t}
+table inet {t} {{
+  set {s} {{ type ipv4_addr; flags timeout; counter;{els} }}
+  set lim_baja {{ type ipv4_addr; size 1024; flags dynamic,timeout; timeout 2m; }}
+  set lim_sube {{ type ipv4_addr; size 1024; flags dynamic,timeout; timeout 2m; }}
+  chain entrada_nat {{
     type nat hook prerouting priority dstnat; policy accept;
-    iifname "wlan0" udp dport 53 dnat ip to 192.168.4.1:5353
-    iifname "wlan0" tcp dport 53 dnat ip to 192.168.4.1:5353
-    iifname "wlan0" tcp dport 80 dnat ip to 192.168.4.1:8080
-  }
-  chain entrada {
+    iifname {ap_set} ip saddr @{s} ip daddr 192.168.4.1 meta l4proto {{ tcp, udp }} th dport 53 dnat ip to {dns}
+    iifname {ap_set} ip saddr @{s} ip daddr != 192.168.4.1 accept
+    iifname {ap_set} udp dport 53 dnat ip to 192.168.4.1:5353
+    iifname {ap_set} tcp dport 53 dnat ip to 192.168.4.1:5353
+    iifname {ap_set} tcp dport 80 dnat ip to 192.168.4.1:8080
+  }}
+  chain entrada {{
     type filter hook input priority -10; policy accept;
-    iifname "wlan0" ct state established,related accept
-    iifname "wlan0" udp dport { 67, 5353 } accept
-    iifname "wlan0" tcp dport 8080 accept
-    iifname "wlan0" icmp type echo-request accept
-    iifname "wlan0" drop
-  }
-  chain reenvio {
+    iifname {ap_set} ct state established,related accept
+    iifname {ap_set} udp dport {{ 67, 5353 }} accept
+    iifname {ap_set} tcp dport 8080 accept
+    iifname {ap_set} icmp type echo-request accept
+    iifname {ap_set} drop
+  }}
+  chain reenvio {{
     type filter hook forward priority -10; policy accept;
-    iifname "wlan0" drop
-    oifname "wlan0" drop
-  }
+    iifname {ap_set} ip saddr @{s} oifname != {{ {lista}, "wg0", "lo" }} ip daddr != {{ {priv_} }} jump inv_sube
+    oifname {ap_set} ip daddr @{s} iifname != {{ {lista}, "wg0", "lo" }} ct state established,related jump inv_baja
+    iifname {ap_set} drop
+    oifname {ap_set} drop
+  }}
+  chain inv_sube {{
+{sube}    meta mark set {m} accept
+  }}
+  chain inv_baja {{
+{baja}    meta mark set {m} accept
+  }}
+  chain salida_nat {{
+    type nat hook postrouting priority srcnat; policy accept;
+    ip saddr 192.168.4.0/24 meta mark {m} masquerade
+  }}
+}}
+"#,
+        sube = lim("lim_sube", "saddr", cfg.sube_mbps),
+        baja = lim("lim_baja", "daddr", cfg.baja_mbps),
+    )
 }
-"#;
 
 pub fn firewall_on() -> bool {
     let path = "/run/stickd-captive.nft";
-    if std::fs::write(path, NFT).is_err() {
+    let reglas = nft_reglas(&invitados::ap_ifaces(), &invitados::config(), &invitados::elementos());
+    if std::fs::write(path, reglas).is_err() {
         return false;
     }
     let ok = run("nft", &["-f", path]).0;
-    if !ok {
+    if ok {
+        invitados::al_subir_ap();
+    } else {
         log("captive: no pude cargar las reglas nft");
     }
     ok
 }
 
 pub fn firewall_off() {
+    invitados::al_bajar_ap();
     let _ = run("nft", &["delete", "table", "inet", "stickd_captive"]);
 }
 
@@ -175,8 +220,19 @@ fn guest_server(vitrinas: Arc<Vec<Box<dyn Vitrina>>>, activa: Activa) {
         let (path, query) = (path.to_string(), query.to_string());
         let method = req.method().as_str().to_string();
 
-        let resp = if is_probe(&host, &path) {
-            GuestResp::redirect("http://192.168.4.1/")
+        let cliente = ip.unwrap();
+        let resp = if path == invitados::RUTA {
+            // "Internet para invitados": lo maneja el núcleo, no el módulo
+            invitados::pagina(cliente, &method)
+        } else if is_probe(&host, &path) {
+            if invitados::tiene_internet(cliente) {
+                // que el teléfono vea "hay internet" y se quede conectado
+                invitados::sonda_exito(&host, &path)
+            } else if invitados::sonda_directa(cliente) {
+                GuestResp::redirect(&format!("http://192.168.4.1{}", invitados::RUTA))
+            } else {
+                GuestResp::redirect("http://192.168.4.1/")
+            }
         } else {
             let mut body = Vec::new();
             let limit = v.max_body() as u64 + 1;
@@ -184,8 +240,8 @@ fn guest_server(vitrinas: Arc<Vec<Box<dyn Vitrina>>>, activa: Activa) {
             if body.len() as u64 >= limit {
                 GuestResp { status: 413, content_type: "text/plain; charset=utf-8".into(), headers: vec![], body: "archivo demasiado grande".into() }
             } else {
-                let g = GuestReq { method: &method, path: &path, query: &query, host: &host, user_agent: &ua, content_type: &ct, body: &body, client_ip: ip.unwrap() };
-                v.guest(&g)
+                let g = GuestReq { method: &method, path: &path, query: &query, host: &host, user_agent: &ua, content_type: &ct, body: &body, client_ip: cliente };
+                invitados::procesar_respuesta(v.guest(&g), cliente, &method)
             }
         };
         let _ = req.respond(to_tiny(resp));
@@ -257,6 +313,31 @@ mod tests {
         let r = dns_answer(&q).unwrap();
         assert_eq!(u16::from_be_bytes([r[6], r[7]]), 0);
     }
+    /// NFT_OUT=/ruta cargo test volcar_reglas -- --ignored  (para revisar con `nft -c -f`)
+    #[test]
+    #[ignore]
+    fn volcar_reglas() {
+        let out = std::env::var("NFT_OUT").unwrap_or_else(|_| "/tmp/stickd-captive.nft".into());
+        let r = nft_reglas(&["wlan0".into(), "stkp0".into()], &invitados::Config::default(), &[("192.168.4.9".parse().unwrap(), 120)]);
+        std::fs::write(out, r).unwrap();
+    }
+    #[test]
+    fn reglas_invitados() {
+        let ap = vec!["wlan0".to_string()];
+        let mut c = invitados::Config::default();
+        let r = nft_reglas(&ap, &c, &[]);
+        assert!(r.contains("set invitados { type ipv4_addr; flags timeout; counter; }"));
+        assert!(r.contains("ip saddr @invitados ip daddr != 192.168.4.1 accept"));
+        assert!(r.contains("10.0.0.0/8") && r.contains("100.64.0.0/10") && r.contains("172.16.0.0/12") && r.contains("192.168.0.0/16"));
+        assert!(r.contains("limit rate over 625000 bytes/second") && r.contains("limit rate over 125000 bytes/second"));
+        assert!(r.contains("tcp dport 8080 accept") && !r.contains("dport 80 accept"), "el panel (80) nunca se abre al AP");
+        c.baja_mbps = 0.0;
+        let r = nft_reglas(&ap, &c, &[("192.168.4.9".parse().unwrap(), 120)]);
+        assert!(!r.contains("@lim_baja {"), "sin límite de bajada no hay policía");
+        assert!(r.contains("elements = { 192.168.4.9 timeout 120s };"));
+        let r = nft_reglas(&["wlan0".into(), "stkp0".into()], &c, &[]);
+        assert!(r.contains("iifname { \"wlan0\", \"stkp0\" } drop"));
+    }
     #[test]
     fn detecta_sondas() {
         assert!(is_probe("connectivitycheck.gstatic.com", "/generate_204"));
@@ -267,8 +348,8 @@ mod tests {
 }
 
 /// ¿Este invitado ya tiene acceso a internet (aceptó "Continuar con internet" y no ha expirado)?
-/// ESQUELETO: lo implementa el módulo de internet para invitados. Hoy siempre es `false`.
+/// Consulta el estado en memoria de `invitados` (se sincroniza con el set nft cada 3 s).
 #[allow(dead_code)]
-pub fn cliente_tiene_internet(_ip: std::net::IpAddr) -> bool {
-    false
+pub fn cliente_tiene_internet(ip: std::net::IpAddr) -> bool {
+    invitados::tiene_internet(ip)
 }

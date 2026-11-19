@@ -5,7 +5,7 @@
 
 use crate::captive::{self, Activa};
 use crate::util::{form, html, json};
-use crate::{net, save_mode, save_powerbank, save_ssid, ssid_for, Mode, Request, State, Vitrinas};
+use crate::{invitados, net, save_mode, save_powerbank, save_ssid, ssid_for, Mode, Request, State, Vitrinas};
 use std::io::Read;
 use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
@@ -86,6 +86,10 @@ pub fn spawn(state: Arc<Mutex<State>>, vit: Vitrinas, activa: Activa) {
                         None => Response::from_string("no encontrado").with_status_code(404),
                     },
                 }
+            } else if is_post && (path == "/invitados" || path.starts_with("/invitados/")) {
+                let accion = path.strip_prefix("/invitados").unwrap_or("").trim_start_matches('/');
+                let msg = invitados::admin_post(accion, &form(&String::from_utf8_lossy(&body)));
+                page(&state, &vit, &msg, Some("invitados"))
             } else if is_post {
                 let msg = handle_post(&state, &vit, &path, &form(&String::from_utf8_lossy(&body)));
                 page(&state, &vit, &msg, None)
@@ -373,6 +377,7 @@ fieldset>p{{margin:0 0 8px;font-size:14px}}
 <section class=card><h2>Al conectarlo a una powerbank</h2>
 <p class=mut style="margin-top:0">Si no hay una computadora en el USB por 10 s, el stick arranca esta vitrina sola. Al volver a conectarlo a la PC regresa a su modo.</p>
 <form method=post action=/powerbank class=row><select name=valor style=flex:1>{pb_opts}</select><button>Guardar</button></form></section>
+<section class="card plegable" id=invitados><details{inv_open}><summary><span class=st><span class=h2>Internet para invitados</span><small class=mut>{inv_res}</small></span><span class=abrir></span></summary><div class=cuerpo>{inv_html}</div></details></section>
 <h2 style="margin:22px 0 4px">Vitrinas</h2>
 <p class=mut style="margin:0 0 10px">Toca una para configurarla. Para ponerla al aire elígela arriba, en «Modo de trabajo» → «Vitrina».</p>
 {vit_cards}
@@ -406,6 +411,9 @@ row('LTE (SIM)',s.lte.sim?e(s.lte.estado)+' · señal '+e(s.lte.senal)+'% '+e(s.
 row('Túnel WireGuard',e(s.wireguard))+row('Direcciones IP','<pre>'+e(s.ips)+'</pre>');}}catch(_){{}}}}
 f();setInterval(f,5000);
 </script></body></html>"#,
+        inv_open = if abrir == Some("invitados") { " open" } else { "" },
+        inv_res = html(&invitados::resumen()),
+        inv_html = invitados::admin_html(),
         msg_html = if msg.is_empty() { String::new() } else { format!("<div class=msg role=status>{msg}</div>") },
         saved = if saved.is_empty() { "<li>Ninguna guardada</li>".into() } else { saved },
         accion = if cfg { "salir" } else { "entrar" },
