@@ -725,7 +725,14 @@ fn descargar_en(url: &str, tmp: &Path, op: &Opciones, progreso: &dyn Fn(&str)) -
             break;
         }
         n += 1;
-        progreso(&format!("Descargando recurso {} de {}…", n, n + cola.len()));
+        progreso(&format!(
+            "Descargando archivo {} de {} · {} {} listos · {} KB bajados",
+            n + 1,
+            n + 1 + cola.len(),
+            ok + 1,
+            if ok == 0 { "archivo" } else { "archivos" },
+            total / 1024
+        ));
         let Ok((efect, ct)) = bajar(op, &u.texto(), &parcial) else {
             fallidos += 1;
             continue;
@@ -762,7 +769,7 @@ fn descargar_en(url: &str, tmp: &Path, op: &Opciones, progreso: &dyn Fn(&str)) -
     }
     let _ = fs::remove_file(&parcial);
 
-    progreso("Reescribiendo rutas…");
+    progreso(&format!("Terminando: ajustando enlaces · {} archivos · {} KB bajados", ok + 1, total / 1024));
     let nuevo = reescribir_html(&html, &refs, &base, &mapa, "index.html");
     fs::write(&idx, nuevo).map_err(|e| e.to_string())?;
     for (local, ubase, bytes) in css_docs {

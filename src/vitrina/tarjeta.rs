@@ -679,7 +679,7 @@ impl Vitrina for Tarjeta {
         "tarjeta"
     }
     fn nombre(&self) -> &'static str {
-        "Tarjeta de presentacion"
+        "Tarjeta de presentación"
     }
     fn descripcion(&self) -> &'static str {
         "Guardan tu contacto con un toque"

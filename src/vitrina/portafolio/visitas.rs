@@ -108,7 +108,7 @@ impl Visitas {
 
 // ───────────── Fecha/hora local sin dependencias ─────────────
 
-fn desfase() -> i64 {
+pub fn desfase() -> i64 {
     static O: OnceLock<i64> = OnceLock::new();
     *O.get_or_init(|| {
         let (ok, s) = crate::util::run("date", &["+%z"]);

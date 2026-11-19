@@ -1,13 +1,16 @@
 //! Vitrina "Portafolio": quien se conecta al WiFi ve la página de portafolio del usuario.
 //!
-//! Fuentes posibles (elige el admin):
-//!   - `sitio`: archivos subidos desde el panel (data_dir/sitio/), servidos tal cual.
-//!   - `url`: un enlace. Si hay copia offline (data_dir/copia/, bajada con curl) se sirve esa;
-//!     si no, una landing con el enlace en grande y su código QR.
-//! Si la fuente elegida no tiene nada, se muestra la landing (si hay enlace) o "aún no hay
-//! portafolio".
+//! El stick guarda VARIOS sitios con nombre en `data_dir/sitios/<id>/`:
+//!   - subidos desde el panel (archivos estáticos, servidos tal cual), o
+//!   - copias offline de un enlace (bajadas con curl), cada una con su origen.
+//! Uno de ellos es el ACTIVO (`activo=<id>` en config.txt) y es el que ven los invitados.
+//! Si no hay activo, se muestra la landing con el enlace y su QR (si hay enlace) o
+//! "aún no hay portafolio".
 //!
-//! Archivos en data_dir: `config.txt` (clave=valor), `visitas.txt`, `sitio/`, `copia/`.
+//! Datos de cada sitio en `sitios/<id>/.info` (clave=valor; oculto, nunca se sirve).
+//! Archivos en data_dir: `config.txt`, `visitas.txt`, `sitios/`.
+//! Versiones anteriores usaban `sitio/` (un solo sitio subido) y `copia/` (una sola copia):
+//! `migrar()` los convierte en sitios guardados al arrancar sin perder nada.
 
 mod copia;
 mod paginas;
@@ -20,65 +23,225 @@ use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::Duration;
+use std::time::{Duration, UNIX_EPOCH};
 
 const MB: u64 = 1024 * 1024;
 const PREFIJO: &str = "/vitrina/portafolio";
+/// Tope de una copia offline (además del tope total)
+const MAX_COPIA: u64 = 100 * MB;
 
-#[derive(Clone, Copy, PartialEq, Debug, Default)]
-enum Fuente {
-    #[default]
-    Sitio,
-    Url,
+fn una_linea(s: &str) -> String {
+    s.replace(['\n', '\r'], " ")
+}
+
+fn escribir_atomico(p: &Path, s: &str) {
+    let tmp = p.with_file_name(format!(".{}.tmp", p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()));
+    if fs::write(&tmp, s).is_ok() {
+        let _ = fs::rename(&tmp, p);
+    }
+}
+
+fn claves(t: &str) -> Vec<(String, String)> {
+    t.lines().filter_map(|l| l.split_once('=')).map(|(k, v)| (k.to_string(), v.to_string())).collect()
 }
 
 #[derive(Clone, Default, Debug)]
 struct Config {
-    fuente: Fuente,
+    /// id del sitio que ven los invitados ("" = ninguno → landing)
+    activo: String,
+    /// Enlace para la landing con QR (y el que se ofrece para descargar copia)
     url: String,
     titulo: String,
     subtitulo: String,
-    /// Resumen de la última copia descargada ("23 archivos · 1.2 MB · 18/11/2026 14:02")
-    copia_info: String,
-    /// URL de la que se hizo la copia
-    copia_de: String,
 }
 
 impl Config {
     fn cargar(p: &Path) -> Config {
         let mut c = Config::default();
-        if let Ok(t) = fs::read_to_string(p) {
-            for l in t.lines() {
-                let Some((k, v)) = l.split_once('=') else { continue };
-                let v = v.to_string();
-                match k {
-                    "fuente" => c.fuente = if v == "url" { Fuente::Url } else { Fuente::Sitio },
-                    "url" => c.url = v,
-                    "titulo" => c.titulo = v,
-                    "subtitulo" => c.subtitulo = v,
-                    "copia_info" => c.copia_info = v,
-                    "copia_de" => c.copia_de = v,
-                    _ => {}
-                }
+        for (k, v) in claves(&fs::read_to_string(p).unwrap_or_default()) {
+            match k.as_str() {
+                "activo" => c.activo = v,
+                "url" => c.url = v,
+                "titulo" => c.titulo = v,
+                "subtitulo" => c.subtitulo = v,
+                _ => {}
             }
         }
         c
     }
     fn guardar(&self, p: &Path) {
-        let una = |s: &str| s.replace(['\n', '\r'], " ");
         let s = format!(
-            "fuente={}\nurl={}\ntitulo={}\nsubtitulo={}\ncopia_info={}\ncopia_de={}\n",
-            if self.fuente == Fuente::Url { "url" } else { "sitio" },
-            una(&self.url),
-            una(&self.titulo),
-            una(&self.subtitulo),
-            una(&self.copia_info),
-            una(&self.copia_de)
+            "version=2\nactivo={}\nurl={}\ntitulo={}\nsubtitulo={}\n",
+            una_linea(&self.activo),
+            una_linea(&self.url),
+            una_linea(&self.titulo),
+            una_linea(&self.subtitulo)
         );
-        let tmp = p.with_extension("tmp");
-        if fs::write(&tmp, s).is_ok() {
-            let _ = fs::rename(&tmp, p);
+        escribir_atomico(p, &s);
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Debug, Default)]
+enum Tipo {
+    #[default]
+    Subido,
+    Copia,
+}
+
+/// Un sitio guardado en el stick.
+#[derive(Clone, Default, Debug)]
+struct Sitio {
+    id: String,
+    nombre: String,
+    tipo: Tipo,
+    /// URL de la que se hizo la copia (solo copias)
+    origen: String,
+    /// "18/11/2026 22:07" (hora local de la subida o la descarga)
+    fecha: String,
+    /// Para ordenar: segundos locales
+    ts: i64,
+    /// Nota de la última descarga ("3 recursos no se pudieron bajar")
+    nota: String,
+    // calculados al listar
+    archivos: usize,
+    bytes: u64,
+}
+
+impl Sitio {
+    fn cargar(dir: &Path, id: &str) -> Sitio {
+        let mut s = Sitio { id: id.to_string(), nombre: id.to_string(), ..Default::default() };
+        for (k, v) in claves(&fs::read_to_string(dir.join(".info")).unwrap_or_default()) {
+            match k.as_str() {
+                "nombre" if !v.trim().is_empty() => s.nombre = v,
+                "tipo" => s.tipo = if v == "copia" { Tipo::Copia } else { Tipo::Subido },
+                "origen" => s.origen = v,
+                "fecha" => s.fecha = v,
+                "ts" => s.ts = v.parse().unwrap_or(0),
+                "nota" => s.nota = v,
+                _ => {}
+            }
         }
+        let a = listar(dir);
+        s.archivos = a.len();
+        s.bytes = a.iter().map(|x| x.1).sum();
+        s
+    }
+    fn guardar(&self, dir: &Path) {
+        let t = format!(
+            "nombre={}\ntipo={}\norigen={}\nfecha={}\nts={}\nnota={}\n",
+            una_linea(&self.nombre),
+            if self.tipo == Tipo::Copia { "copia" } else { "subido" },
+            una_linea(&self.origen),
+            una_linea(&self.fecha),
+            self.ts,
+            una_linea(&self.nota)
+        );
+        escribir_atomico(&dir.join(".info"), &t);
+    }
+}
+
+/// ids de sitio: solo [a-z0-9-], 1..=40, sin guion al inicio ni al final.
+fn id_valido(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 40
+        && id.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+        && !id.starts_with('-')
+        && !id.ends_with('-')
+}
+
+/// Convierte un nombre libre en un id ("Mi Página 2" → "mi-pagina-2").
+fn slug(nombre: &str) -> String {
+    let mut o = String::new();
+    for c in nombre.chars().flat_map(|c| c.to_lowercase()) {
+        let c = match c {
+            'á' | 'à' | 'ä' | 'â' => 'a',
+            'é' | 'è' | 'ë' | 'ê' => 'e',
+            'í' | 'ì' | 'ï' | 'î' => 'i',
+            'ó' | 'ò' | 'ö' | 'ô' => 'o',
+            'ú' | 'ù' | 'ü' | 'û' => 'u',
+            'ñ' => 'n',
+            c => c,
+        };
+        if c.is_ascii_alphanumeric() {
+            o.push(c);
+        } else if !o.is_empty() && !o.ends_with('-') {
+            o.push('-');
+        }
+        if o.len() >= 36 {
+            break;
+        }
+    }
+    let o = o.trim_matches('-').to_string();
+    if o.is_empty() { "sitio".into() } else { o }
+}
+
+/// Primer id libre a partir del nombre (agrega -2, -3… si ya existe).
+fn id_libre(sitios: &Path, nombre: &str) -> String {
+    let base = slug(nombre);
+    let mut id = base.clone();
+    let mut n = 2;
+    while sitios.join(&id).exists() || sitios.join(format!("{id}.nueva")).exists() {
+        id = format!("{base}-{n}");
+        n += 1;
+    }
+    id
+}
+
+fn mtime_local(p: &Path) -> i64 {
+    let t = fs::metadata(p).and_then(|m| m.modified()).ok().and_then(|t| t.duration_since(UNIX_EPOCH).ok());
+    t.map(|d| d.as_secs() as i64).unwrap_or(0) + visitas::desfase()
+}
+
+/// Convierte el formato viejo (`sitio/` + `copia/` + `fuente=`) en sitios guardados.
+/// Idempotente: si ya no hay nada viejo no hace nada. Si la config era del formato viejo,
+/// queda activo lo que se mostraba antes (la copia con `fuente=url`, si no el sitio subido).
+fn migrar(dir: &Path) {
+    let conf_p = dir.join("config.txt");
+    let texto = fs::read_to_string(&conf_p).unwrap_or_default();
+    let kv = claves(&texto);
+    let get = |k: &str| kv.iter().find(|(a, _)| a == k).map(|(_, b)| b.clone()).unwrap_or_default();
+    let vieja = get("version") != "2";
+    let sitios = dir.join("sitios");
+    let _ = fs::create_dir_all(&sitios);
+    let mut activo: Option<String> = None;
+
+    let copia = dir.join("copia");
+    if copia.join("index.html").is_file() {
+        let origen = get("copia_de");
+        let origen = if origen.is_empty() { get("url") } else { origen };
+        let nombre = copia::Url::parse(&origen).map(|u| u.host).unwrap_or_else(|| "Copia de mi página".into());
+        let id = id_libre(&sitios, &nombre);
+        let ts = mtime_local(&copia.join("index.html"));
+        if fs::rename(&copia, sitios.join(&id)).is_ok() {
+            let s = Sitio { id: id.clone(), nombre, tipo: Tipo::Copia, origen, fecha: visitas::fecha_hora(ts), ts, ..Default::default() };
+            s.guardar(&sitios.join(&id));
+            crate::util::log(&format!("portafolio: copia vieja migrada como sitio «{id}»"));
+            if get("fuente") == "url" {
+                activo = Some(id);
+            }
+        }
+    }
+    let sitio = dir.join("sitio");
+    if !entradas_visibles(&sitio).is_empty() {
+        let id = id_libre(&sitios, "sitio-subido");
+        let ts = mtime_local(&sitio);
+        if fs::rename(&sitio, sitios.join(&id)).is_ok() {
+            let s = Sitio { id: id.clone(), nombre: "Sitio subido".into(), tipo: Tipo::Subido, fecha: visitas::fecha_hora(ts), ts, ..Default::default() };
+            s.guardar(&sitios.join(&id));
+            crate::util::log(&format!("portafolio: sitio subido viejo migrado como «{id}»"));
+            if get("fuente") != "url" {
+                activo = Some(id);
+            }
+        }
+    } else {
+        let _ = fs::remove_dir(&sitio); // vacía: ya no se usa
+    }
+    let _ = fs::remove_dir(&copia); // solo si quedó vacía
+
+    if vieja {
+        let mut c = Config::cargar(&conf_p);
+        c.activo = activo.unwrap_or_default();
+        c.guardar(&conf_p);
     }
 }
 
@@ -89,7 +252,9 @@ struct Compartido {
     /// Mensaje de estado de la descarga en curso / última
     estado_descarga: Mutex<String>,
     descargando: AtomicBool,
-    /// Serializa las subidas (el cálculo del total y la escritura)
+    /// id del sitio que se está descargando
+    descargando_id: Mutex<String>,
+    /// Serializa subidas, borrados y el cálculo del espacio usado
     subida: Mutex<()>,
     max_archivo: u64,
     max_total: u64,
@@ -343,7 +508,14 @@ impl Portafolio {
     }
 
     fn con_limites(dir: PathBuf, max_archivo: u64, max_total: u64, curl: &str) -> Self {
-        let _ = fs::create_dir_all(dir.join("sitio"));
+        let _ = fs::create_dir_all(&dir);
+        migrar(&dir);
+        // restos de una descarga interrumpida (apagón a medio bajar)
+        for e in fs::read_dir(dir.join("sitios")).map(|r| r.flatten().collect::<Vec<_>>()).unwrap_or_default() {
+            if e.file_name().to_string_lossy().ends_with(".nueva") {
+                let _ = fs::remove_dir_all(e.path());
+            }
+        }
         let conf = Config::cargar(&dir.join("config.txt"));
         let visitas = visitas::Visitas::cargar(dir.join("visitas.txt"));
         Portafolio {
@@ -352,6 +524,7 @@ impl Portafolio {
                 visitas: Mutex::new(visitas),
                 estado_descarga: Mutex::new(String::new()),
                 descargando: AtomicBool::new(false),
+                descargando_id: Mutex::new(String::new()),
                 subida: Mutex::new(()),
                 max_archivo,
                 max_total,
@@ -361,11 +534,17 @@ impl Portafolio {
         }
     }
 
-    fn sitio(&self) -> PathBuf {
-        self.s.dir.join("sitio")
+    fn sitios_dir(&self) -> PathBuf {
+        self.s.dir.join("sitios")
     }
-    fn copia(&self) -> PathBuf {
-        self.s.dir.join("copia")
+    /// Carpeta de un sitio existente (None si el id no es válido o no existe).
+    fn dir_sitio(&self, id: &str) -> Option<PathBuf> {
+        if !id_valido(id) {
+            return None;
+        }
+        let d = self.sitios_dir().join(id);
+        let es_dir = fs::symlink_metadata(&d).map(|m| m.is_dir()).unwrap_or(false);
+        es_dir.then_some(d)
     }
     fn conf(&self) -> Config {
         bloquear(&self.s.conf).clone()
@@ -376,28 +555,39 @@ impl Portafolio {
         c.guardar(&self.s.dir.join("config.txt"));
     }
 
-    fn hay_copia(&self) -> bool {
-        self.copia().join("index.html").is_file()
-    }
-    fn hay_sitio(&self) -> bool {
-        !entradas_visibles(&self.sitio()).is_empty()
+    /// Sitios guardados, el más reciente primero.
+    fn sitios(&self) -> Vec<Sitio> {
+        let mut v: Vec<Sitio> = fs::read_dir(self.sitios_dir())
+            .map(|r| r.flatten().collect::<Vec<_>>())
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|e| {
+                let id = e.file_name().to_string_lossy().into_owned();
+                let d = self.dir_sitio(&id)?;
+                Some(Sitio::cargar(&d, &id))
+            })
+            .collect();
+        v.sort_by(|a, b| b.ts.cmp(&a.ts).then(a.nombre.cmp(&b.nombre)));
+        v
     }
 
-    /// Carpeta que se sirve ahora mismo, si hay alguna.
-    fn raiz_activa(&self, c: &Config) -> Option<PathBuf> {
-        match c.fuente {
-            Fuente::Url if self.hay_copia() => Some(self.copia()),
-            Fuente::Sitio if self.hay_sitio() => Some(raiz_web(&self.sitio())),
-            _ => None,
-        }
+    fn uso_total(&self) -> u64 {
+        listar(&self.sitios_dir()).iter().map(|x| x.1).sum()
     }
 
-    /// Responde una ruta (ya decodificada) para invitado o vista previa. `prefijo` se antepone
-    /// a las redirecciones. Devuelve también si fue una página HTML (para contar visitas).
-    fn responder(&self, path: &str, prefijo: &str) -> (GuestResp, bool) {
+    /// Raíz web de un sitio, si tiene algo que mostrar.
+    fn raiz_de(&self, id: &str) -> Option<PathBuf> {
+        let d = self.dir_sitio(id)?;
+        (!entradas_visibles(&d).is_empty()).then(|| raiz_web(&d))
+    }
+
+    /// Responde una ruta (ya decodificada) de `raiz` para invitado o vista previa (sin raíz →
+    /// landing o "aún no hay portafolio"). `prefijo` se antepone a las redirecciones. Devuelve
+    /// también si fue una página HTML (para contar visitas).
+    fn responder(&self, raiz: Option<PathBuf>, path: &str, prefijo: &str) -> (GuestResp, bool) {
         let c = self.conf();
         let path = if path.is_empty() { "/" } else { path };
-        let Some(raiz) = self.raiz_activa(&c) else {
+        let Some(raiz) = raiz else {
             if path != "/" && !parece_pagina(path) {
                 return (GuestResp::not_found(), false);
             }
@@ -430,20 +620,66 @@ impl Portafolio {
         bloquear(&self.s.visitas).registrar(ip, visitas::dia_local());
     }
 
+    fn ocupado(&self, id: &str) -> bool {
+        self.s.descargando.load(Ordering::SeqCst) && *bloquear(&self.s.descargando_id) == id
+    }
+
     // ─────────── acciones de admin ───────────
 
-    fn subir(&self, ruta: &str, body: &[u8]) -> String {
+    /// Crea un sitio nuevo con `nombre`, o vacía `sitio` para reemplazarlo. Responde
+    /// "OK <id>" (lo lee el JS de subida) o un mensaje de error.
+    fn preparar(&self, sitio: &str, nombre: &str) -> String {
+        let nombre: String = nombre.trim().chars().filter(|c| !c.is_control()).take(60).collect();
+        let _g = bloquear(&self.s.subida);
+        let sitios = self.sitios_dir();
+        let (id, mut s) = if sitio.is_empty() {
+            if nombre.is_empty() {
+                return "Escribe un nombre para el sitio nuevo.".into();
+            }
+            let id = id_libre(&sitios, &nombre);
+            if fs::create_dir_all(sitios.join(&id)).is_err() {
+                return "No pude crear la carpeta del sitio.".into();
+            }
+            (id.clone(), Sitio { id, nombre, ..Default::default() })
+        } else {
+            let Some(d) = self.dir_sitio(sitio) else { return "Ese sitio ya no existe.".into() };
+            if self.ocupado(sitio) {
+                return "Ese sitio se está descargando; espera a que termine.".into();
+            }
+            let mut s = Sitio::cargar(&d, sitio);
+            for p in entradas_visibles(&d) {
+                let _ = if p.is_dir() { fs::remove_dir_all(&p) } else { fs::remove_file(&p) };
+            }
+            if !nombre.is_empty() {
+                s.nombre = nombre;
+            }
+            s.tipo = Tipo::Subido;
+            s.origen.clear();
+            s.nota.clear();
+            (sitio.to_string(), s)
+        };
+        s.ts = visitas::ahora_local();
+        s.fecha = visitas::fecha_hora(s.ts);
+        s.guardar(&sitios.join(&id));
+        format!("OK {id}")
+    }
+
+    fn subir(&self, sitio: &str, ruta: &str, body: &[u8]) -> String {
         let ruta = match sanear_ruta(ruta) {
             Ok(r) => r,
             Err(e) => return format!("No se guardó «{}»: {}.", html(ruta), html(&e)),
         };
         let _g = bloquear(&self.s.subida);
+        let Some(dir) = self.dir_sitio(sitio) else { return format!("No se guardó «{}»: el sitio no existe.", html(&ruta)) };
+        if self.ocupado(sitio) {
+            return format!("No se guardó «{}»: ese sitio se está descargando.", html(&ruta));
+        }
         if body.len() as u64 > self.s.max_archivo {
             return format!("No se guardó «{}»: pesa más de {} MB.", html(&ruta), self.s.max_archivo / MB);
         }
-        let destino = self.sitio().join(&ruta);
+        let destino = dir.join(&ruta);
         let previo = fs::metadata(&destino).map(|m| m.len()).unwrap_or(0);
-        let usado: u64 = listar(&self.sitio()).iter().map(|x| x.1).sum();
+        let usado = self.uso_total();
         if usado - previo.min(usado) + body.len() as u64 > self.s.max_total {
             return format!("No se guardó «{}»: se pasaría del límite total de {} MB.", html(&ruta), self.s.max_total / MB);
         }
@@ -460,72 +696,128 @@ impl Portafolio {
             let _ = fs::remove_file(&tmp);
             return format!("No se guardó «{}»: {}.", html(&ruta), html(&e.to_string()));
         }
-        self.cambiar_conf(|c| c.fuente = Fuente::Sitio);
         format!("Archivo guardado: {} ({}).", html(&ruta), tam_humano(body.len() as u64))
+    }
+
+    fn usar(&self, sitio: &str) -> String {
+        if sitio.is_empty() {
+            let c = self.conf();
+            self.cambiar_conf(|c| c.activo.clear());
+            return if c.url.is_empty() {
+                "Ya no se muestra ningún sitio: los invitados verán «aún no hay portafolio».".into()
+            } else {
+                "Ahora los invitados ven la página con tu enlace y su código QR.".into()
+            };
+        }
+        let Some(d) = self.dir_sitio(sitio) else { return "Ese sitio ya no existe.".into() };
+        let s = Sitio::cargar(&d, sitio);
+        self.cambiar_conf(|c| c.activo = sitio.to_string());
+        let aviso = if self.raiz_de(sitio).is_none() { " Ojo: todavía no tiene archivos." } else { "" };
+        format!("Ahora los invitados ven «{}».{aviso}", html(&s.nombre))
+    }
+
+    fn borrar_sitio(&self, sitio: &str) -> String {
+        let _g = bloquear(&self.s.subida);
+        let Some(d) = self.dir_sitio(sitio) else { return "Ese sitio ya no existe.".into() };
+        if self.ocupado(sitio) {
+            return "Ese sitio se está descargando; espera a que termine.".into();
+        }
+        let s = Sitio::cargar(&d, sitio);
+        if fs::remove_dir_all(&d).is_err() {
+            return "No se pudo borrar.".into();
+        }
+        let era_activo = self.conf().activo == sitio;
+        if era_activo {
+            self.cambiar_conf(|c| c.activo.clear());
+        }
+        format!(
+            "Sitio «{}» borrado.{}",
+            html(&s.nombre),
+            if era_activo { " Era el activo: ahora se muestra la página con el enlace y QR (o «aún no hay portafolio»)." } else { "" }
+        )
     }
 
     fn guardar_url(&self, f: &[(String, String)]) -> Result<String, String> {
         let url = campo(f, "url").trim().to_string();
         let titulo: String = campo(f, "titulo").trim().chars().take(80).collect();
         let subtitulo: String = campo(f, "subtitulo").trim().chars().take(140).collect();
-        if !url.is_empty() {
-            if url.len() > 1000 || copia::Url::parse(&url).is_none() {
-                return Err("El enlace debe empezar con http:// o https:// (máx. 1000 caracteres).".into());
-            }
-        }
-        let cambio = url != self.conf().copia_de;
-        if cambio && self.hay_copia() && !self.s.descargando.load(Ordering::SeqCst) {
-            let _ = fs::remove_dir_all(self.copia());
+        if !url.is_empty() && (url.len() > 1000 || copia::Url::parse(&url).is_none()) {
+            return Err("El enlace debe empezar con http:// o https:// (máx. 1000 caracteres).".into());
         }
         self.cambiar_conf(|c| {
-            if cambio {
-                c.copia_info.clear();
-                c.copia_de.clear();
-            }
             c.url = url.clone();
             c.titulo = titulo;
             c.subtitulo = subtitulo;
-            if !url.is_empty() {
-                c.fuente = Fuente::Url;
-            }
         });
         Ok(url)
     }
 
-    fn iniciar_descarga(&self, url: String, sincrono: bool) -> String {
+    /// Baja una copia de `url` como sitio: si ya hay una copia de ese mismo enlace (o se pasa
+    /// `sitio`), la actualiza; si no, crea un sitio nuevo con `nombre` (o el dominio).
+    fn iniciar_descarga(&self, url: String, sitio: &str, nombre: &str, usar: bool, sincrono: bool) -> String {
         if url.is_empty() {
             return "Primero escribe el enlace de tu página.".into();
         }
+        let Some(u) = copia::Url::parse(&url) else { return "El enlace debe empezar con http:// o https://.".into() };
+        let nombre: String = nombre.trim().chars().filter(|c| !c.is_control()).take(60).collect();
         if self.s.descargando.swap(true, Ordering::SeqCst) {
-            return "Ya hay una descarga en curso.".into();
+            return "Ya hay una descarga en curso; espera a que termine.".into();
         }
-        *bloquear(&self.s.estado_descarga) = "Descargando…".into();
+        let (id, previo) = {
+            let _g = bloquear(&self.s.subida);
+            let existente = self
+                .sitios()
+                .into_iter()
+                .find(|s| if sitio.is_empty() { s.tipo == Tipo::Copia && s.origen == url } else { s.id == sitio && s.tipo == Tipo::Copia });
+            match existente {
+                Some(s) => (s.id.clone(), Some(s)),
+                None => (id_libre(&self.sitios_dir(), if nombre.is_empty() { &u.host } else { &nombre }), None),
+            }
+        };
+        let usado_otros = self.uso_total() - previo.as_ref().map(|s| s.bytes).unwrap_or(0).min(self.uso_total());
+        let espacio = self.s.max_total.saturating_sub(usado_otros).min(MAX_COPIA);
+        if espacio < MB {
+            self.s.descargando.store(false, Ordering::SeqCst);
+            return format!("No hay espacio: los sitios guardados ya usan casi {} MB. Borra alguno primero.", self.s.max_total / MB);
+        }
+        *bloquear(&self.s.descargando_id) = id.clone();
+        *bloquear(&self.s.estado_descarga) = "Empezando la descarga…".into();
         let s = Arc::clone(&self.s);
+        let nombre = match &previo {
+            _ if !nombre.is_empty() => nombre,
+            Some(p) => p.nombre.clone(),
+            None => u.host.clone(),
+        };
         let trabajo = move || {
             let op = copia::Opciones {
                 curl: s.curl.clone(),
-                max_total: 100 * MB,
+                max_total: espacio,
                 max_recursos: 400,
                 externos: true,
                 limite_tiempo: Duration::from_secs(300),
             };
             let progreso = |m: &str| *bloquear(&s.estado_descarga) = m.to_string();
-            let r = copia::descargar(&url, &s.dir.join("copia"), &op, &progreso);
+            let dest = s.dir.join("sitios").join(&id);
+            let r = copia::descargar(&url, &dest, &op, &progreso);
             let msg = match r {
                 Ok(res) => {
-                    let info = format!(
-                        "{} archivos · {} · {}{}",
+                    let ts = visitas::ahora_local();
+                    let nota = if res.fallidos > 0 { format!("{} recursos no se pudieron bajar", res.fallidos) } else { String::new() };
+                    let si = Sitio { id: id.clone(), nombre: nombre.clone(), tipo: Tipo::Copia, origen: url.clone(), fecha: visitas::fecha_hora(ts), ts, nota: nota.clone(), ..Default::default() };
+                    si.guardar(&dest);
+                    if usar {
+                        let mut c = bloquear(&s.conf);
+                        c.activo = id.clone();
+                        c.guardar(&s.dir.join("config.txt"));
+                    }
+                    format!(
+                        "Copia lista: «{}» · {} archivos · {}{}{}",
+                        nombre,
                         res.archivos,
                         tam_humano(res.bytes),
-                        visitas::fecha_hora(visitas::ahora_local()),
-                        if res.fallidos > 0 { format!(" · {} recursos no se pudieron bajar", res.fallidos) } else { String::new() }
-                    );
-                    let mut c = bloquear(&s.conf);
-                    c.copia_info = info.clone();
-                    c.copia_de = url.clone();
-                    c.fuente = Fuente::Url;
-                    c.guardar(&s.dir.join("config.txt"));
-                    format!("Copia lista: {info}")
+                        if nota.is_empty() { String::new() } else { format!(" · {nota}") },
+                        if usar { " · ya es la que ven los invitados" } else { "" }
+                    )
                 }
                 Err(e) => format!("Error al descargar: {e}"),
             };
@@ -537,17 +829,22 @@ impl Portafolio {
             html(&bloquear(&self.s.estado_descarga))
         } else {
             std::thread::spawn(trabajo);
-            "Descarga iniciada; el estado se actualiza abajo. Necesita que el stick tenga internet.".into()
+            "Descarga iniciada. Abajo, en «Portafolio», se ve el avance. Necesita que el stick tenga internet.".into()
         }
     }
 
-    fn borrar_archivo(&self, ruta: &str) -> String {
+    fn borrar_archivo(&self, sitio: &str, ruta: &str) -> String {
         let Ok(r) = sanear_ruta(ruta) else { return "Ruta no válida.".into() };
-        let p = self.sitio().join(&r);
+        let _g = bloquear(&self.s.subida);
+        let Some(d) = self.dir_sitio(sitio) else { return "Ese sitio ya no existe.".into() };
+        if self.ocupado(sitio) {
+            return "Ese sitio se está descargando; espera a que termine.".into();
+        }
+        let p = d.join(&r);
         match fs::remove_file(&p) {
             Ok(_) => {
-                if let Some(d) = p.parent() {
-                    quitar_vacias(d.to_path_buf(), &self.sitio());
+                if let Some(x) = p.parent() {
+                    quitar_vacias(x.to_path_buf(), &d);
                 }
                 format!("Borrado: {}.", html(&r))
             }
@@ -576,7 +873,8 @@ impl Vitrina for Portafolio {
 
     fn guest(&self, req: &GuestReq) -> GuestResp {
         let path = pct_decode(req.path);
-        let (r, pagina) = self.responder(&path, "");
+        let raiz = self.raiz_de(&self.conf().activo);
+        let (r, pagina) = self.responder(raiz, &path, "");
         if pagina && r.status == 200 {
             self.contar(req.client_ip);
         }
@@ -592,41 +890,61 @@ impl Vitrina for Portafolio {
             r.headers.push(("Cache-Control".into(), "no-store".into()));
             return Some(r);
         }
-        if ruta == "vista" {
+        // vista/… = lo que ven los invitados ahora; ver/<id>/… = un sitio guardado;
+        // ver/-/ = la landing con el enlace y QR
+        let (raiz, prefijo, resto) = if ruta == "vista" || ruta == "ver" {
             return Some(GuestResp::redirect(&format!("{PREFIJO}/vista/")));
-        }
-        if let Some(resto) = ruta.strip_prefix("vista/") {
-            let path = format!("/{}", pct_decode(resto));
-            let (mut r, _) = self.responder(&path, &format!("{PREFIJO}/vista"));
-            // El contenido (sobre todo una copia de un sitio ajeno) corre aislado: origen opaco,
-            // sin formularios ni fetch, para que no pueda tocar el panel de admin.
-            r.headers.push(("Content-Security-Policy".into(), "sandbox allow-scripts allow-popups; connect-src 'none'; form-action 'none'".into()));
-            return Some(r);
-        }
-        // GET a una acción (p.ej. recargar tras un POST): de vuelta al panel
-        if matches!(ruta, "fuente" | "url" | "descargar" | "borrar_copia" | "subir" | "borrar_sitio" | "borrar_archivo" | "reiniciar_visitas") {
-            return Some(GuestResp::redirect("/"));
-        }
-        None
+        } else if let Some(resto) = ruta.strip_prefix("vista/") {
+            (self.raiz_de(&self.conf().activo), format!("{PREFIJO}/vista"), resto)
+        } else if let Some(r) = ruta.strip_prefix("ver/") {
+            let (id, resto) = r.split_once('/').unwrap_or((r, ""));
+            if !r.contains('/') {
+                return Some(GuestResp::redirect(&format!("{PREFIJO}/ver/{}/", if id_valido(id) { id } else { "-" })));
+            }
+            if id == "-" {
+                (None, format!("{PREFIJO}/ver/-"), resto)
+            } else {
+                self.dir_sitio(id)?;
+                (self.raiz_de(id), format!("{PREFIJO}/ver/{id}"), resto)
+            }
+        } else {
+            // GET a una acción (p.ej. recargar tras un POST): de vuelta al panel
+            if matches!(ruta, "url" | "descargar" | "preparar" | "subir" | "usar" | "borrar" | "borrar_archivo" | "reiniciar_visitas") {
+                return Some(GuestResp::redirect("/"));
+            }
+            return None;
+        };
+        let path = format!("/{}", pct_decode(resto));
+        let (mut r, _) = self.responder(raiz, &path, &prefijo);
+        // El contenido (sobre todo una copia de un sitio ajeno) corre aislado: origen opaco,
+        // sin formularios ni fetch, para que no pueda tocar el panel de admin.
+        r.headers.push(("Content-Security-Policy".into(), "sandbox allow-scripts allow-popups; connect-src 'none'; form-action 'none'".into()));
+        Some(r)
     }
 
     fn admin_post(&self, accion: &str, form: &[(String, String)], body: &[u8]) -> String {
         match accion {
-            "subir" => self.subir(campo(form, "ruta"), body),
-            "fuente" => {
-                let f = if campo(form, "fuente") == "url" { Fuente::Url } else { Fuente::Sitio };
-                self.cambiar_conf(|c| c.fuente = f);
-                match f {
-                    Fuente::Url => "Fuente activa: enlace.".into(),
-                    Fuente::Sitio => "Fuente activa: archivos subidos.".into(),
-                }
-            }
+            "preparar" => self.preparar(campo(form, "sitio"), campo(form, "nombre")),
+            "subir" => self.subir(campo(form, "sitio"), campo(form, "ruta"), body),
+            "usar" => self.usar(campo(form, "sitio")),
+            "borrar" => self.borrar_sitio(campo(form, "sitio")),
             "url" => match self.guardar_url(form) {
                 Ok(u) if u.is_empty() => "Datos guardados (sin enlace).".into(),
-                Ok(_) => "Enlace guardado. Los invitados verán la landing con el QR hasta que descargues una copia.".into(),
+                Ok(_) => "Enlace guardado.".into(),
                 Err(e) => e,
             },
             "descargar" => {
+                let usar = campo(form, "usar") == "1";
+                let sitio = campo(form, "sitio");
+                if !sitio.is_empty() {
+                    // «Actualizar copia» de un sitio de la lista
+                    let Some(d) = self.dir_sitio(sitio) else { return "Ese sitio ya no existe.".into() };
+                    let s = Sitio::cargar(&d, sitio);
+                    if s.tipo != Tipo::Copia {
+                        return "Ese sitio no es una copia de un enlace.".into();
+                    }
+                    return self.iniciar_descarga(s.origen, sitio, "", usar, self.sincrono());
+                }
                 let url = if form.iter().any(|(k, _)| k == "url") {
                     match self.guardar_url(form) {
                         Ok(u) => u,
@@ -635,26 +953,9 @@ impl Vitrina for Portafolio {
                 } else {
                     self.conf().url
                 };
-                self.iniciar_descarga(url, self.sincrono())
+                self.iniciar_descarga(url, "", campo(form, "nombre"), usar, self.sincrono())
             }
-            "borrar_copia" => {
-                if self.s.descargando.load(Ordering::SeqCst) {
-                    return "Espera a que termine la descarga.".into();
-                }
-                let _ = fs::remove_dir_all(self.copia());
-                self.cambiar_conf(|c| {
-                    c.copia_info.clear();
-                    c.copia_de.clear();
-                });
-                "Copia offline borrada; se mostrará la landing con el QR.".into()
-            }
-            "borrar_sitio" => {
-                let _g = bloquear(&self.s.subida);
-                let _ = fs::remove_dir_all(self.sitio());
-                let _ = fs::create_dir_all(self.sitio());
-                "Sitio borrado.".into()
-            }
-            "borrar_archivo" => self.borrar_archivo(campo(form, "ruta")),
+            "borrar_archivo" => self.borrar_archivo(campo(form, "sitio"), campo(form, "ruta")),
             "reiniciar_visitas" => {
                 bloquear(&self.s.visitas).reiniciar();
                 "Contador de visitas en cero.".into()
@@ -669,21 +970,26 @@ impl Vitrina for Portafolio {
         format!("{hoy} {} hoy · {} en total", if hoy == 1 { "visita" } else { "visitas" }, v.total)
     }
 
+    fn abierta(&self) -> bool {
+        self.s.descargando.load(Ordering::SeqCst)
+    }
+
     fn admin_html(&self) -> String {
         let c = self.conf();
-        let archivos = listar(&self.sitio());
-        let total: u64 = archivos.iter().map(|x| x.1).sum();
-        let hay_copia = self.hay_copia();
+        let sitios = self.sitios();
+        let usado: u64 = sitios.iter().map(|s| s.bytes).sum();
         let descargando = self.s.descargando.load(Ordering::SeqCst);
+        let desc_id = bloquear(&self.s.descargando_id).clone();
         let estado_desc = bloquear(&self.s.estado_descarga).clone();
+        let activo = sitios.iter().find(|s| s.id == c.activo && self.raiz_de(&s.id).is_some());
 
-        let activa = match (self.raiz_activa(&c).is_some(), c.fuente) {
-            (true, Fuente::Sitio) => format!("<b>Archivos subidos</b> ({} archivos, {})", archivos.len(), tam_humano(total)),
-            (true, Fuente::Url) => format!("<b>Copia offline</b> de <code>{}</code>", html(&c.copia_de)),
-            (false, _) if !c.url.is_empty() => format!("<b>Landing con enlace y QR</b> → <code>{}</code>", html(&c.url)),
-            _ => "<b>Nada aún</b>: los invitados ven «aún no hay portafolio».".into(),
+        let ahora = match activo {
+            Some(s) => format!("<b>{}</b> <span class=mut>({})</span>", html(&s.nombre), if s.tipo == Tipo::Copia { "copia de un enlace" } else { "sitio subido" }),
+            None if !c.url.is_empty() => format!("<b>Página con tu enlace y código QR</b> <span class=mut>({})</span>", html(&c.url)),
+            None => "<b>Nada todavía</b>: ven «aún no hay portafolio».".into(),
         };
 
+        // ── visitas ──
         let (dia, hoy, tot, hist) = {
             let v = bloquear(&self.s.visitas);
             let d = visitas::dia_local();
@@ -704,113 +1010,194 @@ impl Vitrina for Portafolio {
             })
             .collect();
 
-        let mostrar = 300;
-        let lista: String = archivos
-            .iter()
-            .take(mostrar)
-            .map(|(r, t)| {
+        // ── lista de sitios ──
+        let mut lista = String::new();
+        for s in &sitios {
+            let es_activo = activo.map(|a| a.id == s.id).unwrap_or(false);
+            let ocupado = descargando && desc_id == s.id;
+            let id = html(&s.id);
+            let tipo = match s.tipo {
+                Tipo::Copia => format!("Copia de <span class=url>{}</span>", html(&s.origen)),
+                Tipo::Subido => "Sitio subido".into(),
+            };
+            let detalles = format!(
+                "{tipo} · {} · {} {} · {}{}",
+                tam_humano(s.bytes),
+                s.archivos,
+                if s.archivos == 1 { "archivo" } else { "archivos" },
+                if s.fecha.is_empty() { "sin fecha".into() } else { html(&s.fecha) },
+                if s.nota.is_empty() { String::new() } else { format!(" · {}", html(&s.nota)) }
+            );
+            let usar = if es_activo {
+                String::new()
+            } else {
+                format!("<form method=post action={PREFIJO}/usar><input type=hidden name=sitio value=\"{id}\"><button>Usar este</button></form>")
+            };
+            let actualizar = if s.tipo == Tipo::Copia && !descargando {
                 format!(
-                    "<li><span>{r}<small> · {}</small></span><form method=post action={PREFIJO}/borrar_archivo><input type=hidden name=ruta value=\"{r}\"><button class=link title=Borrar>borrar</button></form></li>",
-                    tam_humano(*t),
-                    r = html(r)
+                    "<form method=post action=\"{PREFIJO}/descargar#v-portafolio\" class=pf-bajar><input type=hidden name=sitio value=\"{id}\"><input type=hidden name=usar value=\"{}\"><button class=sec>Volver a descargar</button></form>",
+                    if es_activo { "1" } else { "0" }
                 )
-            })
-            .collect();
-        let mas = if archivos.len() > mostrar { format!("<li>… y {} más</li>", archivos.len() - mostrar) } else { String::new() };
+            } else {
+                String::new()
+            };
+            let borrar = if ocupado {
+                "<span class=mut>descargando…</span>".to_string()
+            } else {
+                format!(
+                    "<form method=post action={PREFIJO}/borrar onsubmit=\"return confirm('¿Borrar este sitio del stick? No se puede deshacer.')\"><input type=hidden name=sitio value=\"{id}\"><button class=peligro>Borrar</button></form>"
+                )
+            };
+            let archivos = listar(&self.sitios_dir().join(&s.id));
+            let mostrar = 300;
+            let filas: String = archivos
+                .iter()
+                .take(mostrar)
+                .map(|(r, t)| {
+                    let quitar = if s.tipo == Tipo::Subido {
+                        format!(
+                            "<form method=post action={PREFIJO}/borrar_archivo><input type=hidden name=sitio value=\"{id}\"><input type=hidden name=ruta value=\"{r}\"><button class=link>quitar</button></form>",
+                            r = html(r)
+                        )
+                    } else {
+                        String::new()
+                    };
+                    format!("<li><span>{}<small> · {}</small></span>{quitar}</li>", html(r), tam_humano(*t))
+                })
+                .collect();
+            let mas = if archivos.len() > mostrar { format!("<li>… y {} más</li>", archivos.len() - mostrar) } else { String::new() };
+            lista += &format!(
+                r#"<li class="sitio{cls}"><div class=nom><b>{nombre}</b>{tag}</div><div class=mut>{detalles}</div>
+<div class=fila>{usar}<a class="btn sec" href="{PREFIJO}/ver/{id}/" target=_blank rel=noopener>Vista previa</a>{actualizar}{borrar}</div>
+<details class=chica><summary>Ver archivos ({n})</summary><ul class=archivos>{filas}{mas}</ul></details></li>"#,
+                cls = if es_activo { " act" } else { "" },
+                nombre = html(&s.nombre),
+                tag = if es_activo { " <span class=tag>ACTIVO · lo ven los invitados</span>" } else { "" },
+                n = archivos.len(),
+            );
+        }
+        // la landing también se puede elegir
+        if !c.url.is_empty() || activo.is_none() {
+            let es = activo.is_none();
+            lista += &format!(
+                r#"<li class="sitio{cls}"><div class=nom><b>{nom}</b>{tag}</div><div class=mut>{det}</div><div class=fila>{usar}<a class="btn sec" href="{PREFIJO}/ver/-/" target=_blank rel=noopener>Vista previa</a></div></li>"#,
+                cls = if es { " act" } else { "" },
+                nom = if c.url.is_empty() { "Sin sitio («aún no hay portafolio»)" } else { "Página con tu enlace y código QR" },
+                tag = if es { " <span class=tag>ACTIVO · lo ven los invitados</span>" } else { "" },
+                det = if c.url.is_empty() { "Se muestra cuando no eliges ningún sitio. Escribe tu enlace abajo para que muestre un QR.".into() } else { format!("No es una copia: solo el enlace <span class=url>{}</span> en grande y su QR, para abrirlo con datos.", html(&c.url)) },
+                usar = if es { String::new() } else { format!("<form method=post action={PREFIJO}/usar><input type=hidden name=sitio value=\"\"><button>Usar esta</button></form>") },
+            );
+        }
 
-        let chk = |f: Fuente| if c.fuente == f { "checked" } else { "" };
-        let copia_txt = if hay_copia {
-            format!("Copia offline: {}", html(&c.copia_info))
-        } else if c.url.is_empty() {
-            "Sin enlace.".into()
-        } else {
-            "Sin copia offline: los invitados ven la landing con el enlace y su QR.".into()
-        };
+        let destinos: String = sitios
+            .iter()
+            .filter(|s| !(descargando && desc_id == s.id))
+            .map(|s| format!("<option value=\"{}\">Reemplazar «{}»</option>", html(&s.id), html(&s.nombre)))
+            .collect();
 
         format!(
             r#"<div class=pf><style>
-.pf .mut{{color:var(--mut,#888);font-size:14px}}.pf code{{word-break:break-all;font-size:13px}}
-.pf h3{{font-size:15px;margin:18px 0 8px}}.pf .fila{{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin:8px 0}}
-.pf .fila form{{margin:0}}.pf .sec{{background:#4f8cff22;color:var(--tx,inherit)}}.pf .peligro{{background:var(--bad,#ff5d5d)}}
-.pf input[type=url],.pf input[type=text]{{width:100%;padding:10px;border-radius:8px;border:1px solid #8884;background:var(--bg,transparent);color:var(--tx,inherit);margin:4px 0 8px;font-size:16px}}
-.pf input[type=file]{{max-width:100%;margin:4px 0 8px;color:var(--mut,#888)}}
-.pf ul.archivos{{max-height:260px;overflow:auto;font-size:14px}}.pf ul.archivos span{{word-break:break-all}}
+.pf .url{{word-break:break-all}}.pf h3{{font-size:16px;margin:22px 0 8px;padding-top:14px;border-top:1px solid var(--bd)}}
+.pf .fila{{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin:10px 0 4px}}.pf .fila form{{margin:0}}
+.pf .ahora{{background:var(--soft);border-radius:10px;padding:10px 12px;margin:0 0 6px}}
+.pf ul.sitios>li{{display:block;border:1px solid var(--bd);border-radius:10px;padding:10px 12px;margin-bottom:10px}}
+.pf ul.sitios>li.act{{border:2px solid var(--ok)}}.pf .nom{{font-size:16px;word-break:break-word}}
+.pf .tag{{display:inline-block;background:var(--ok);color:#06210f;font-size:12px;font-weight:700;border-radius:6px;padding:1px 7px;margin-left:4px;vertical-align:middle}}
+.pf .mut{{font-size:14px}}.pf ul.archivos{{max-height:240px;overflow:auto;font-size:14px;margin:6px 0 0}}.pf ul.archivos span{{word-break:break-all}}
 .pf .barras{{display:grid;grid-template-columns:repeat(7,1fr);gap:6px;height:92px;align-items:end;margin:8px 0}}
 .pf .barras div{{display:flex;flex-direction:column;justify-content:flex-end;align-items:center;height:100%}}
-.pf .barras i{{display:block;width:100%;max-width:28px;background:var(--ac,#4f8cff);border-radius:4px 4px 0 0}}
-.pf .barras small{{font-size:11px;color:var(--mut,#888);line-height:1.2}}
-.pf #pf-subida,.pf #pf-estado{{font-size:14px;margin:6px 0;white-space:pre-wrap}}
+.pf .barras i{{display:block;width:100%;max-width:28px;background:var(--ac);border-radius:4px 4px 0 0}}
+.pf .barras small{{font-size:11px;color:var(--mut);line-height:1.2}}
+.pf .progreso{{border:1px solid var(--bd);border-radius:10px;padding:10px 12px;margin:10px 0}}.pf .progreso[hidden]{{display:none}}
+.pf progress{{width:100%;height:14px;margin:0 0 6px}}.pf #pf-subida,.pf #pf-estado{{font-size:14px;white-space:pre-wrap;word-break:break-word}}
+.pf .chk{{display:flex;gap:8px;align-items:center;margin:4px 0 10px}}.pf input[type=file]{{max-width:100%;margin:4px 0 10px}}
 </style>
-<p>Activo ahora: {activa}</p>
-<div class=fila><a href="{PREFIJO}/vista/" target=_blank rel=noopener><button type=button class=sec>Vista previa ↗</button></a></div>
+<p class=ahora>Los invitados ven ahora: {ahora}<br><a class="btn sec" style="margin-top:8px" href="{PREFIJO}/vista/" target=_blank rel=noopener>Ver lo que ven ↗</a></p>
+
+<h3>Sitios guardados en el stick</h3>
+<p class=mut style="margin-top:0">{n_sitios} · usan {usado} de {max_total} MB. Toca «Usar este» para elegir cuál ven los invitados.</p>
+<ul class=sitios>{lista}</ul>
+
+<h3>Copiar una página web al stick</h3>
+<p class=mut style="margin-top:0">El stick baja la página con sus imágenes y estilos para mostrarla sin internet. Cada copia se guarda como un sitio más.</p>
+<form method=post action="{PREFIJO}/descargar#v-portafolio" class=pf-bajar>
+<label>Enlace de tu página<input type=url name=url value="{url}" placeholder="https://tu-sitio.com" maxlength=1000 inputmode=url autocomplete=off></label>
+<label>Nombre de la copia (opcional)<input type=text name=nombre maxlength=60 placeholder="si lo dejas vacío, se usa el dominio"></label>
+<label class=chk><input type=checkbox name=usar value=1 checked> Mostrarla a los invitados al terminar</label>
+<details class=chica><summary>Página con enlace y QR (cuando no hay sitio)</summary>
+<p class=mut>Si eliges «Página con tu enlace y código QR», los invitados ven esto con el enlace de arriba.</p>
+<label>Tu nombre<input type=text name=titulo value="{titulo}" placeholder="Yael Montoya" maxlength=80></label>
+<label>Frase corta<input type=text name=subtitulo value="{subtitulo}" placeholder="Diseño · Desarrollo · Fotografía" maxlength=140></label>
+</details>
+<div class=fila><button {dis_bajar}>Guardar y descargar copia</button><button formaction={PREFIJO}/url class=sec>Solo guardar el enlace</button></div></form>
+<div id=pf-progreso class=progreso data-activo={activo_n}{oculto}>
+<progress id=pf-barra{oculto_barra}></progress>
+<div id=pf-estado role=status aria-live=polite>{estado}</div></div>
+<p class=mut>Máx. 100 MB y 400 archivos por copia; tarda de segundos a unos minutos. Las páginas que arman su contenido con JavaScript desde internet pueden verse incompletas: revisa la vista previa.</p>
+
+<h3>Subir un sitio desde esta computadora</h3>
+<p class=mut style="margin-top:0">Sube la carpeta de tu sitio (con <code>index.html</code>) o archivos sueltos. Nombres de archivo solo con letras sin acento, números, espacio, <code>. _ -</code>. Máx. 25 MB por archivo y 300 MB entre todos los sitios.</p>
+<label>Guardar como<select id=pf-destino><option value="">Sitio nuevo</option>{destinos}</select></label>
+<label id=pf-nombre-l>Nombre del sitio nuevo<input type=text id=pf-nombre maxlength=60 placeholder="Mi portafolio"></label>
+<label>Carpeta<input type=file id=pf-carpeta webkitdirectory multiple></label>
+<label>…o archivos sueltos<input type=file id=pf-archivos multiple></label>
+<label class=chk><input type=checkbox id=pf-usar checked> Mostrarlo a los invitados al terminar</label>
+<div class=fila><button type=button id=pf-subir>Subir</button></div>
+<div id=pf-subida role=status aria-live=polite></div>
 
 <h3>Visitas</h3>
-<p class=mut style="margin:0">{hoy} hoy · {tot} en total (únicas por dispositivo y día)</p>
+<p class=mut style="margin:0">{hoy} hoy · {tot} en total (cada celular cuenta una vez por día)</p>
 <div class=barras>{barras_html}</div>
-<form method=post action={PREFIJO}/reiniciar_visitas onsubmit="return confirm('¿Poner el contador en cero?')"><button class="link">reiniciar contador</button></form>
-
-<h3>Fuente</h3>
-<form method=post action={PREFIJO}/fuente>
-<label class=opt><input type=radio name=fuente value=sitio {c_sitio}><span><b>Archivos subidos</b><small>Tu sitio estático (HTML/CSS/JS/imágenes) guardado en el stick.</small></span></label>
-<label class=opt><input type=radio name=fuente value=url {c_url}><span><b>Enlace</b><small>Copia offline del enlace si la descargaste; si no, una landing con el enlace y su QR.</small></span></label>
-<button>Usar esta fuente</button></form>
-
-<h3>Enlace a tu página</h3>
-<form method=post action={PREFIJO}/url>
-<label>Enlace<input type=url name=url value="{url}" placeholder="https://tu-sitio.com" maxlength=1000 inputmode=url autocomplete=off></label>
-<label>Nombre para la landing<input type=text name=titulo value="{titulo}" placeholder="Yael Montoya" maxlength=80></label>
-<label>Frase corta<input type=text name=subtitulo value="{subtitulo}" placeholder="Diseño · Desarrollo · Fotografía" maxlength=140></label>
-<div class=fila><button>Guardar</button><button formaction={PREFIJO}/descargar class=sec>Guardar y descargar copia</button></div></form>
-<p class=mut>{copia_txt}</p>
-<div id=pf-estado data-activo={activo}>{estado}</div>
-{borrar_copia}
-<p class=mut>La copia baja el HTML y sus CSS, JS, imágenes y fuentes (máx. 100 MB, 400 archivos). Sitios que arman su contenido con JS desde APIs pueden verse incompletos sin internet: revisa la vista previa.</p>
-
-<h3>Subir tu sitio</h3>
-<p class=mut>Sube la carpeta de tu sitio (con <code>index.html</code>) o archivos sueltos. Nombres solo con letras sin acento, números, espacio, <code>. _ -</code>. Máx. 25 MB por archivo y 300 MB en total.</p>
-<label>Carpeta<input type=file id=pf-carpeta webkitdirectory multiple></label>
-<label>Archivos<input type=file id=pf-archivos multiple></label>
-<div class=fila><button type=button id=pf-subir>Subir</button></div>
-<div id=pf-subida></div>
-<p class=mut>{n_arch} archivos · {tam_total} de 300 MB</p>
-<ul class=archivos>{lista}{mas}</ul>
-<form method=post action={PREFIJO}/borrar_sitio onsubmit="return confirm('¿Borrar TODOS los archivos subidos?')"><button class=peligro>Borrar sitio</button></form>
+<form method=post action={PREFIJO}/reiniciar_visitas onsubmit="return confirm('¿Poner el contador en cero?')"><button class=link>Reiniciar contador</button></form>
 <script>(function(){{
-var P='{PREFIJO}',$=function(i){{return document.getElementById(i)}};
+var P='{PREFIJO}',$=function(i){{return document.getElementById(i)}},enc=encodeURIComponent;
+var de=$('pf-destino');de.onchange=function(){{$('pf-nombre-l').hidden=!!de.value}};
 function lista(inp,carpeta){{return Array.prototype.map.call(inp.files||[],function(f){{
 var r=(carpeta&&f.webkitRelativePath)?f.webkitRelativePath:f.name;
 if(carpeta&&f.webkitRelativePath){{var i=r.indexOf('/');if(i>0)r=r.slice(i+1)}}return [f,r]}})
 .filter(function(x){{return !x[1].split('/').some(function(c){{return c.charAt(0)=='.'}})}})}}
 $('pf-subir').onclick=async function(){{
-var t=lista($('pf-carpeta'),true).concat(lista($('pf-archivos'),false)),st=$('pf-subida'),ok=0,mal=[];
+var t=lista($('pf-carpeta'),true).concat(lista($('pf-archivos'),false)),st=$('pf-subida'),ok=0,mal=[],b=this;
+var dest=de.value,nom=$('pf-nombre').value.trim();
 if(!t.length){{st.textContent='Elige una carpeta o archivos primero.';return}}
-this.disabled=true;
+if(!dest&&!nom){{st.textContent='Escribe un nombre para el sitio nuevo.';$('pf-nombre').focus();return}}
+if(dest&&!confirm('Se borrarán los archivos que tenía ese sitio y se pondrán los nuevos. ¿Seguir?'))return;
+b.disabled=true;st.textContent='Preparando…';
+try{{var rp=await fetch(P+'/preparar?sitio='+enc(dest)+'&nombre='+enc(nom),{{method:'POST'}});var x=await rp.text()}}catch(e){{x=String(e)}}
+if(x.indexOf('OK ')!=0){{st.textContent=x;b.disabled=false;return}}
+var id=x.slice(3).trim();
 for(var i=0;i<t.length;i++){{var f=t[i][0],r=t[i][1];
 st.textContent='Subiendo '+(i+1)+' de '+t.length+': '+r;
 if(f.size>25*1024*1024){{mal.push(r+': pesa más de 25 MB');continue}}
-try{{var resp=await fetch(P+'/subir?ruta='+encodeURIComponent(r),{{method:'POST',body:f}});var x=await resp.text();
-if(resp.ok&&x.indexOf('Archivo guardado')>=0)ok++;else{{var m=x.match(/No se guard[^<]*/);mal.push(m?m[0]:r+': error '+resp.status)}}}}
+try{{var resp=await fetch(P+'/subir?sitio='+enc(id)+'&ruta='+enc(r),{{method:'POST',body:f}});var y=await resp.text();
+if(resp.ok&&y.indexOf('Archivo guardado')>=0)ok++;else{{var m=y.match(/No se guard[^<]*/);mal.push(m?m[0]:r+': error '+resp.status)}}}}
 catch(e){{mal.push(r+': '+e)}}}}
+if(ok&&$('pf-usar').checked){{try{{await fetch(P+'/usar?sitio='+enc(id),{{method:'POST'}})}}catch(_){{}}}}
 st.textContent='Listo: '+ok+' de '+t.length+' archivos subidos.'+(mal.length?'\n'+mal.join('\n'):'')+'\nRecargando…';
-setTimeout(function(){{location.href='/'}},mal.length?6000:1200)}};
-var e=$('pf-estado');if(e&&e.dataset.activo=='1'){{var iv=setInterval(async function(){{try{{
+setTimeout(function(){{location.href='/#v-portafolio'}},mal.length?6000:1200)}};
+var pg=$('pf-progreso'),e=$('pf-estado'),barra=$('pf-barra');
+Array.prototype.forEach.call(document.querySelectorAll('form.pf-bajar'),function(fm){{fm.addEventListener('submit',function(ev){{
+if(ev.submitter&&ev.submitter.getAttribute('formaction'))return;
+pg.hidden=false;barra.hidden=false;e.textContent='Iniciando la descarga…'}})}});
+if(pg.dataset.activo=='1'){{var iv=setInterval(async function(){{try{{
 var x=await (await fetch(P+'/estado',{{cache:'no-store'}})).text();var a=x.split('\n');e.textContent=a.slice(1).join('\n');
-if(a[0]!='1'){{clearInterval(iv);setTimeout(function(){{location.href='/'}},2500)}}}}catch(_){{}}}},2000)}}
+if(a[0]!='1'){{clearInterval(iv);barra.hidden=true;setTimeout(function(){{location.href='/#v-portafolio'}},2500)}}}}catch(_){{}}}},1500)}}
 }})();</script></div>"#,
-            c_sitio = chk(Fuente::Sitio),
-            c_url = chk(Fuente::Url),
+            n_sitios = match sitios.len() {
+                0 => "Aún no hay sitios guardados".to_string(),
+                1 => "1 sitio".to_string(),
+                n => format!("{n} sitios"),
+            },
+            usado = tam_humano(usado),
+            max_total = self.s.max_total / MB,
             url = html(&c.url),
             titulo = html(&c.titulo),
             subtitulo = html(&c.subtitulo),
-            activo = if descargando { 1 } else { 0 },
+            dis_bajar = if descargando { "disabled title=\"Ya hay una descarga en curso\"" } else { "" },
+            activo_n = if descargando { 1 } else { 0 },
+            oculto = if descargando || !estado_desc.is_empty() { "" } else { " hidden" },
+            oculto_barra = if descargando { "" } else { " hidden" },
             estado = html(&estado_desc),
-            borrar_copia = if hay_copia && !descargando {
-                format!("<form method=post action={PREFIJO}/borrar_copia><button class=link>borrar copia offline</button></form>")
-            } else {
-                String::new()
-            },
-            n_arch = archivos.len(),
-            tam_total = tam_humano(total),
         )
     }
 }
@@ -853,16 +1240,41 @@ mod tests {
     fn header<'a>(r: &'a GuestResp, k: &str) -> Option<&'a str> {
         r.headers.iter().find(|h| h.0.eq_ignore_ascii_case(k)).map(|h| h.1.as_str())
     }
-    fn subir(p: &Portafolio, ruta: &str, b: &[u8]) -> String {
-        p.admin_post("subir", &[("ruta".into(), ruta.into())], b)
+    fn kv(pares: &[(&str, &str)]) -> Vec<(String, String)> {
+        pares.iter().map(|(a, b)| (a.to_string(), b.to_string())).collect()
+    }
+    /// Crea un sitio nuevo y devuelve su id
+    fn nuevo(p: &Portafolio, nombre: &str) -> String {
+        let r = p.admin_post("preparar", &kv(&[("sitio", ""), ("nombre", nombre)]), &[]);
+        r.strip_prefix("OK ").unwrap_or_else(|| panic!("{r}")).to_string()
+    }
+    fn subir(p: &Portafolio, id: &str, ruta: &str, b: &[u8]) -> String {
+        p.admin_post("subir", &kv(&[("sitio", id), ("ruta", ruta)]), b)
+    }
+    fn usar(p: &Portafolio, id: &str) -> String {
+        p.admin_post("usar", &kv(&[("sitio", id)]), &[])
     }
 
     #[test]
     fn sanea_rutas() {
         assert_eq!(sanear_ruta("css/estilo.css").unwrap(), "css/estilo.css");
         assert_eq!(sanear_ruta("./mi foto.jpg").unwrap(), "mi foto.jpg");
-        for mala in ["", "/etc/passwd", "../x", "a/../../x", "a//b", ".env", "a/.git/config", "a\\b", "niño.jpg", "a/b\0", "x;rm"] {
+        for mala in ["", "/etc/passwd", "../x", "a/../../x", "a//b", ".env", "a/.git/config", "a\\b", "niño.jpg", "a/b\0", "x;rm", ".info"] {
             assert!(sanear_ruta(mala).is_err(), "debió rechazar {mala:?}");
+        }
+    }
+
+    #[test]
+    fn ids_de_sitio() {
+        assert_eq!(slug("Mi Página  #2"), "mi-pagina-2");
+        assert_eq!(slug("mounstroya.xyz"), "mounstroya-xyz");
+        assert_eq!(slug("../../etc"), "etc");
+        assert_eq!(slug("¡¡!!"), "sitio");
+        for bueno in ["a", "mi-sitio-2"] {
+            assert!(id_valido(bueno));
+        }
+        for malo in ["", "-", "-a", "a-", "A", "a.b", "..", "a/b", "sitio.nueva", &"x".repeat(41)] {
+            assert!(!id_valido(malo), "{malo}");
         }
     }
 
@@ -882,17 +1294,26 @@ mod tests {
         assert!(texto(&r).contains("Aún no hay portafolio"));
         assert_eq!(get(&p, "/logo.png", 1).status, 404);
         assert!(p.resumen().starts_with("1 visita hoy"), "{}", p.resumen());
+        assert!(p.admin_html().contains("Aún no hay sitios guardados"));
     }
 
     #[test]
     fn sube_y_sirve_sitio() {
         let t = tmp("sitio");
         let p = Portafolio::with_dir(t.0.clone());
+        let id = nuevo(&p, "Mi sitio");
+        assert_eq!(id, "mi-sitio");
         let html_usuario = b"<html><body><h1>Hola <b>mundo</b></h1><script>1<2</script></body></html>";
-        assert!(subir(&p, "index.html", html_usuario).contains("Archivo guardado"));
-        assert!(subir(&p, "css/estilo.css", b"body{color:red}").contains("Archivo guardado"));
-        assert!(subir(&p, "proyectos/index.html", b"<p>proy</p>").contains("Archivo guardado"));
-        assert!(subir(&p, "img/mi foto.png", &[0x89, b'P', b'N', b'G', 0xff]).contains("Archivo guardado"));
+        assert!(subir(&p, &id, "index.html", html_usuario).contains("Archivo guardado"));
+        assert!(subir(&p, &id, "css/estilo.css", b"body{color:red}").contains("Archivo guardado"));
+        assert!(subir(&p, &id, "proyectos/index.html", b"<p>proy</p>").contains("Archivo guardado"));
+        assert!(subir(&p, &id, "img/mi foto.png", &[0x89, b'P', b'N', b'G', 0xff]).contains("Archivo guardado"));
+        assert!(subir(&p, "no-existe", "a.txt", b"x").contains("no existe"));
+        assert!(subir(&p, "../x", "a.txt", b"x").contains("no existe"));
+
+        // subido pero aún no activo: se sigue viendo «aún no hay»
+        assert!(texto(&get(&p, "/", 1)).contains("Aún no hay portafolio"));
+        assert!(usar(&p, &id).contains("Mi sitio"));
 
         let r = get(&p, "/", 1);
         assert_eq!(r.status, 200);
@@ -910,11 +1331,11 @@ mod tests {
         assert_eq!((r.status, header(&r, "Location")), (302, Some("/proyectos/")));
         assert_eq!(texto(&get(&p, "/proyectos/", 1)), "<p>proy</p>");
 
-        // traversal y ocultos
-        for mala in ["/../config.txt", "/%2e%2e/config.txt", "/..%2fconfig.txt", "/.subiendo-x"] {
+        // traversal y ocultos (.info del sitio nunca se sirve)
+        for mala in ["/../config.txt", "/%2e%2e/config.txt", "/..%2fconfig.txt", "/.subiendo-x", "/.info", "/%2einfo"] {
             let r = get(&p, mala, 1);
             assert!(r.status == 404 || r.status == 302, "{mala}: {}", r.status);
-            assert!(!texto(&r).contains("fuente="), "{mala} filtró config");
+            assert!(!texto(&r).contains("activo=") && !texto(&r).contains("nombre="), "{mala} filtró datos");
         }
         assert_eq!(get(&p, "/no-existe.png", 1).status, 404);
         let r = get(&p, "/pagina/rara", 1);
@@ -924,7 +1345,7 @@ mod tests {
         get(&p, "/", 2);
         assert!(p.resumen().starts_with("2 visitas hoy · 2 en total"), "{}", p.resumen());
 
-        // panel: lista escapada y vista previa aislada
+        // panel: lista escapada y vistas previas aisladas
         let a = p.admin_html();
         assert!(a.contains("img/mi foto.png"));
         let v = p.admin_get("vista/css/estilo.css").unwrap();
@@ -933,20 +1354,148 @@ mod tests {
         let v = p.admin_get("vista/proyectos").unwrap();
         assert_eq!(header(&v, "Location"), Some("/vitrina/portafolio/vista/proyectos/"));
         assert_eq!(header(&p.admin_get("vista").unwrap(), "Location"), Some("/vitrina/portafolio/vista/"));
+        let v = p.admin_get("ver/mi-sitio/proyectos").unwrap();
+        assert_eq!(header(&v, "Location"), Some("/vitrina/portafolio/ver/mi-sitio/proyectos/"));
+        let v = p.admin_get("ver/mi-sitio/css/estilo.css").unwrap();
+        assert!(header(&v, "Content-Security-Policy").unwrap().contains("sandbox"));
+        assert!(p.admin_get("ver/../config.txt").is_none() || p.admin_get("ver/../config.txt").unwrap().status != 200);
+        assert!(p.admin_get("ver/otro/").is_none());
+        let v = p.admin_get("ver/-/").unwrap();
+        assert!(texto(&v).contains("Aún no hay portafolio") && header(&v, "Content-Security-Policy").is_some());
 
-        // borrar un archivo y el sitio
-        assert!(p.admin_post("borrar_archivo", &[("ruta".into(), "proyectos/index.html".into())], &[]).contains("Borrado"));
-        assert!(!t.0.join("sitio/proyectos").exists());
-        p.admin_post("borrar_sitio", &[], &[]);
+        // borrar un archivo y luego el sitio (activo → vuelve a «aún no hay»)
+        assert!(p.admin_post("borrar_archivo", &kv(&[("sitio", &id), ("ruta", "proyectos/index.html")]), &[]).contains("Borrado"));
+        assert!(!t.0.join("sitios/mi-sitio/proyectos").exists());
+        assert!(p.admin_post("borrar", &kv(&[("sitio", &id)]), &[]).contains("Era el activo"));
+        assert!(!t.0.join("sitios/mi-sitio").exists());
         assert!(texto(&get(&p, "/", 1)).contains("Aún no hay portafolio"));
+        assert_eq!(p.conf().activo, "");
+    }
+
+    #[test]
+    fn varios_sitios_y_lista() {
+        let t = tmp("varios");
+        let p = Portafolio::with_dir(t.0.clone());
+        let a = nuevo(&p, "Portafolio <2024>");
+        let b = nuevo(&p, "Portafolio <2024>");
+        assert_eq!((a.as_str(), b.as_str()), ("portafolio-2024", "portafolio-2024-2"));
+        subir(&p, &a, "index.html", b"<p>A</p>");
+        subir(&p, &b, "index.html", b"<p>B</p>");
+        subir(&p, &b, "x.css", b"xx");
+        usar(&p, &a);
+        assert_eq!(texto(&get(&p, "/", 1)), "<p>A</p>");
+        usar(&p, &b);
+        assert_eq!(texto(&get(&p, "/", 1)), "<p>B</p>");
+        // vista previa de uno que NO es el activo
+        assert_eq!(texto(&p.admin_get(&format!("ver/{a}/")).unwrap()), "<p>A</p>");
+
+        let l = p.sitios();
+        assert_eq!(l.len(), 2);
+        let sb = l.iter().find(|s| s.id == b).unwrap();
+        assert_eq!((sb.archivos, sb.bytes, sb.tipo), (2, 10, Tipo::Subido));
+        assert_eq!(sb.nombre, "Portafolio <2024>");
+
+        let h = p.admin_html();
+        assert!(!h.contains("Portafolio <2024>"), "el nombre va escapado");
+        assert!(h.contains("Portafolio &lt;2024&gt;"));
+        assert_eq!(h.matches("ACTIVO").count(), 1);
+        assert!(h.contains("2 sitios"));
+        assert!(h.contains(&format!("/ver/{a}/")) && h.contains("Usar este") && h.contains("Borrar"));
+        assert!(h.contains("Reemplazar «Portafolio &lt;2024&gt;»"));
+
+        // reemplazar: vacía el sitio y conserva el id (sigue activo)
+        assert_eq!(p.admin_post("preparar", &kv(&[("sitio", &b), ("nombre", "Nuevo B")]), &[]), format!("OK {b}"));
+        assert!(!t.0.join("sitios").join(&b).join("x.css").exists());
+        subir(&p, &b, "index.html", b"<p>B2</p>");
+        assert_eq!(texto(&get(&p, "/", 1)), "<p>B2</p>");
+        assert_eq!(p.sitios().iter().find(|s| s.id == b).unwrap().nombre, "Nuevo B");
+        assert!(p.admin_post("preparar", &kv(&[("sitio", "no-hay")]), &[]).contains("ya no existe"));
+        assert!(p.admin_post("preparar", &kv(&[("sitio", ""), ("nombre", "  ")]), &[]).contains("nombre"));
+
+        // persistencia
+        let p2 = Portafolio::with_dir(t.0.clone());
+        assert_eq!(p2.conf().activo, b);
+        assert_eq!(p2.sitios().len(), 2);
+        // usar «ninguno»
+        assert!(usar(&p2, "").contains("aún no hay"));
+        assert!(texto(&get(&p2, "/", 1)).contains("Aún no hay portafolio"));
+        assert!(usar(&p2, "../etc").contains("ya no existe"));
+    }
+
+    #[test]
+    fn migra_formato_viejo() {
+        // lo que hay hoy en el stick: copia de un enlace activa + sitio/ vacío
+        let t = tmp("migra");
+        fs::write(
+            t.0.join("config.txt"),
+            "fuente=url\nurl=https://mounstroya.xyz/\ntitulo=\nsubtitulo=\ncopia_info=7 archivos · 159 KB · 18/11/2026 22:07\ncopia_de=https://mounstroya.xyz/\n",
+        )
+        .unwrap();
+        fs::create_dir_all(t.0.join("copia/imagenes")).unwrap();
+        fs::write(t.0.join("copia/index.html"), "<p>mounstroya</p>").unwrap();
+        fs::write(t.0.join("copia/imagenes/a.png"), [1, 2, 3]).unwrap();
+        fs::create_dir_all(t.0.join("sitio")).unwrap();
+        fs::write(t.0.join("visitas.txt"), "").unwrap();
+
+        let p = Portafolio::with_dir(t.0.clone());
+        assert_eq!(texto(&get(&p, "/", 1)), "<p>mounstroya</p>", "debe seguir sirviendo la copia");
+        assert_eq!(get(&p, "/imagenes/a.png", 1).body, vec![1, 2, 3]);
+        let l = p.sitios();
+        assert_eq!(l.len(), 1);
+        let s = &l[0];
+        assert_eq!((s.id.as_str(), s.nombre.as_str(), s.tipo, s.origen.as_str()), ("mounstroya-xyz", "mounstroya.xyz", Tipo::Copia, "https://mounstroya.xyz/"));
+        assert_eq!(s.archivos, 2);
+        assert!(!s.fecha.is_empty());
+        assert_eq!(p.conf().activo, "mounstroya-xyz");
+        assert_eq!(p.conf().url, "https://mounstroya.xyz/", "el enlace de la landing se conserva");
+        assert!(!t.0.join("copia").exists() && !t.0.join("sitio").exists());
+        let conf = fs::read_to_string(t.0.join("config.txt")).unwrap();
+        assert!(conf.contains("version=2") && conf.contains("activo=mounstroya-xyz"), "{conf}");
+        assert!(p.admin_html().contains("ACTIVO"));
+
+        // idempotente: arrancar de nuevo no cambia nada
+        drop(p);
+        let p = Portafolio::with_dir(t.0.clone());
+        assert_eq!(p.sitios().len(), 1);
+        assert_eq!(p.conf().activo, "mounstroya-xyz");
+        assert_eq!(texto(&get(&p, "/", 1)), "<p>mounstroya</p>");
+    }
+
+    #[test]
+    fn migra_sitio_subido_y_copia() {
+        let t = tmp("migra2");
+        fs::write(t.0.join("config.txt"), "fuente=sitio\nurl=https://a.com/\ncopia_de=https://a.com/\n").unwrap();
+        fs::create_dir_all(t.0.join("copia")).unwrap();
+        fs::write(t.0.join("copia/index.html"), "<p>copia</p>").unwrap();
+        fs::create_dir_all(t.0.join("sitio/misitio")).unwrap();
+        fs::write(t.0.join("sitio/misitio/index.html"), "<p>subido</p>").unwrap();
+        let p = Portafolio::with_dir(t.0.clone());
+        assert_eq!(p.sitios().len(), 2);
+        assert_eq!(p.conf().activo, "sitio-subido");
+        assert_eq!(texto(&get(&p, "/", 1)), "<p>subido</p>");
+        usar(&p, "a-com");
+        assert_eq!(texto(&get(&p, "/", 1)), "<p>copia</p>");
+    }
+
+    #[test]
+    fn migra_enlace_sin_copia() {
+        let t = tmp("migra3");
+        fs::write(t.0.join("config.txt"), "fuente=url\nurl=https://b.com/\ntitulo=Yo\n").unwrap();
+        fs::create_dir_all(t.0.join("sitio")).unwrap();
+        let p = Portafolio::with_dir(t.0.clone());
+        assert!(p.sitios().is_empty());
+        assert_eq!(p.conf().activo, "");
+        assert!(texto(&get(&p, "/", 1)).contains("<svg"), "landing con QR");
     }
 
     #[test]
     fn carpeta_subida_con_raiz() {
         let t = tmp("raiz");
         let p = Portafolio::with_dir(t.0.clone());
-        subir(&p, "misitio/index.html", b"<p>raiz</p>");
-        subir(&p, "misitio/a.css", b"x");
+        let id = nuevo(&p, "raiz");
+        subir(&p, &id, "misitio/index.html", b"<p>raiz</p>");
+        subir(&p, &id, "misitio/a.css", b"x");
+        usar(&p, &id);
         assert_eq!(texto(&get(&p, "/", 1)), "<p>raiz</p>");
         assert_eq!(texto(&get(&p, "/a.css", 1)), "x");
     }
@@ -955,15 +1504,19 @@ mod tests {
     fn limites_y_rutas_malas() {
         let t = tmp("limites");
         let p = Portafolio::con_limites(t.0.clone(), 10, 25, "curl");
-        assert!(subir(&p, "a.txt", &[b'a'; 11]).contains("pesa más"));
-        assert!(subir(&p, "a.txt", &[b'a'; 10]).contains("Archivo guardado"));
-        assert!(subir(&p, "b.txt", &[b'a'; 10]).contains("Archivo guardado"));
-        assert!(subir(&p, "c.txt", &[b'a'; 10]).contains("límite total"));
+        let a = nuevo(&p, "a");
+        let b = nuevo(&p, "b");
+        assert!(subir(&p, &a, "a.txt", &[b'a'; 11]).contains("pesa más"));
+        assert!(subir(&p, &a, "a.txt", &[b'a'; 10]).contains("Archivo guardado"));
+        // el límite total cuenta TODOS los sitios
+        assert!(subir(&p, &b, "b.txt", &[b'a'; 10]).contains("Archivo guardado"));
+        assert!(subir(&p, &b, "c.txt", &[b'a'; 10]).contains("límite total"));
         // reemplazar un archivo existente no cuenta doble
-        assert!(subir(&p, "a.txt", &[b'b'; 10]).contains("Archivo guardado"));
-        let m = subir(&p, "../<script>.txt", b"x");
+        assert!(subir(&p, &a, "a.txt", &[b'b'; 10]).contains("Archivo guardado"));
+        let m = subir(&p, &a, "../<script>.txt", b"x");
         assert!(m.starts_with("No se guardó") && !m.contains("<script>"), "{m}");
-        assert!(subir(&p, "/abs.txt", b"x").contains("absolutas"));
+        assert!(subir(&p, &a, "/abs.txt", b"x").contains("absolutas"));
+        assert!(subir(&p, &a, ".info", b"nombre=x").starts_with("No se guardó"));
         assert!(!t.0.join("abs.txt").exists());
     }
 
@@ -971,7 +1524,7 @@ mod tests {
     fn landing_con_qr_y_escape() {
         let t = tmp("landing");
         let p = Portafolio::with_dir(t.0.clone());
-        let f = |u: &str| vec![("url".to_string(), u.to_string()), ("titulo".to_string(), "Yael <M>".to_string())];
+        let f = |u: &str| kv(&[("url", u), ("titulo", "Yael <M>")]);
         assert!(p.admin_post("url", &f("javascript:alert(1)"), &[]).contains("http"));
         let mala = "https://ejemplo.com/\"><script>alert(1)</script>";
         assert!(p.admin_post("url", &f(mala), &[]).contains("Enlace guardado"));
@@ -982,14 +1535,11 @@ mod tests {
         assert!(s.contains("&lt;script&gt;alert(1)"));
         let a = p.admin_html();
         assert!(!a.contains("<script>alert(1)") && !a.contains("Yael <M>"));
-        assert!(a.contains("Landing con enlace"));
-        // fuente sitio sin archivos → sigue mostrando la landing
-        p.admin_post("fuente", &[("fuente".into(), "sitio".into())], &[]);
-        assert!(texto(&get(&p, "/", 3)).contains("<svg"));
-        // y la config persiste
+        assert!(a.contains("Página con tu enlace y código QR"));
+        // la config persiste
         let p2 = Portafolio::with_dir(t.0.clone());
         assert_eq!(p2.conf().url, mala);
-        assert_eq!(p2.conf().fuente, Fuente::Sitio);
+        assert!(texto(&p2.admin_get("ver/-/").unwrap()).contains("<svg"));
     }
 
     #[test]
@@ -1043,10 +1593,20 @@ mod tests {
 
         let t = tmp("copia");
         let p = Portafolio::con_limites(t.0.clone(), 25 * MB, 300 * MB, "/usr/bin/curl");
+        // un sitio subido activo de antes
+        let sub = nuevo(&p, "subido");
+        subir(&p, &sub, "index.html", b"<p>subido</p>");
+        usar(&p, &sub);
+
         let base = format!("http://127.0.0.1:{puerto}");
-        let msg = p.admin_post("descargar", &[("url".into(), format!("{base}/yo")), ("titulo".into(), "".into())], &[]);
-        assert!(msg.contains("Copia lista"), "{msg}");
+        let msg = p.admin_post("descargar", &kv(&[("url", &format!("{base}/yo")), ("titulo", ""), ("nombre", "Mi copia"), ("usar", "1")]), &[]);
+        assert!(msg.contains("Copia lista") && msg.contains("Mi copia"), "{msg}");
         assert!(msg.contains("1 recursos no se pudieron"), "{msg}");
+        assert_eq!(p.conf().activo, "mi-copia");
+        let l = p.sitios();
+        assert_eq!(l.len(), 2, "la copia es un sitio más; el subido sigue");
+        let c = l.iter().find(|s| s.id == "mi-copia").unwrap();
+        assert_eq!((c.tipo, c.origen.as_str()), (Tipo::Copia, format!("{base}/yo").as_str()));
 
         let idx = texto(&get(&p, "/", 1));
         assert!(idx.contains(r#"href="css/a.css""#), "{idx}");
@@ -1061,19 +1621,46 @@ mod tests {
         assert_eq!(texto(&get(&p, "/css/b.css", 1)), "h1{color:red}");
         assert_eq!(get(&p, "/js/app.js", 1).content_type, "text/javascript; charset=utf-8");
         assert_eq!(get(&p, "/img/fondo.png", 1).body, vec![1, 2, 3]);
-        assert!(p.admin_html().contains("Copia offline"));
+        let h = p.admin_html();
+        assert!(h.contains("Copia de") && h.contains("Volver a descargar"));
+        assert!(h.contains("data-activo=0"));
+        let e = texto(&p.admin_get("estado").unwrap());
+        assert!(e.starts_with("0\nCopia lista"), "{e}");
+
+        // misma URL otra vez → actualiza el mismo sitio (no crea otro)
+        let msg = p.admin_post("descargar", &kv(&[("sitio", "mi-copia"), ("usar", "1")]), &[]);
+        assert!(msg.contains("Copia lista"), "{msg}");
+        let msg = p.admin_post("descargar", &kv(&[("url", &format!("{base}/yo")), ("usar", "0")]), &[]);
+        assert!(msg.contains("Copia lista") && msg.contains("Mi copia"), "{msg}");
+        assert_eq!(p.sitios().len(), 2);
+        // la de un sitio subido no se puede «volver a descargar»
+        assert!(p.admin_post("descargar", &kv(&[("sitio", &sub)]), &[]).contains("no es una copia"));
 
         // falla limpia: no borra la copia buena
-        let msg = p.admin_post("descargar", &[], &[]);
-        assert!(msg.contains("Copia lista"), "{msg}");
         let _ = std::process::Command::new("/usr/bin/curl").args(["-s", &format!("{base}/fin")]).output();
         hilo.join().unwrap();
-        let msg = p.admin_post("descargar", &[], &[]);
+        let msg = p.admin_post("descargar", &kv(&[("sitio", "mi-copia")]), &[]);
         assert!(msg.contains("Error al descargar"), "{msg}");
         assert!(texto(&get(&p, "/", 1)).contains("css/a.css"), "la copia anterior sigue");
+        assert_eq!(p.sitios().len(), 2);
+        // una URL nueva que falla no deja un sitio vacío
+        let msg = p.admin_post("descargar", &kv(&[("url", &format!("{base}/otra")), ("usar", "1")]), &[]);
+        assert!(msg.contains("Error al descargar"), "{msg}");
+        assert_eq!(p.sitios().len(), 2);
+        assert_eq!(p.conf().activo, "mi-copia");
+    }
+}
 
-        // cambiar de enlace borra la copia vieja → landing
-        p.admin_post("url", &[("url".into(), "https://otro.com".into())], &[]);
-        assert!(texto(&get(&p, "/", 1)).contains("<svg"));
+#[cfg(test)]
+impl Portafolio {
+    /// Solo para la vista previa del panel en tests: finge una descarga en curso.
+    pub(crate) fn simular_descarga(&self, id: &str, texto: &str) {
+        self.s.descargando.store(true, Ordering::SeqCst);
+        *bloquear(&self.s.descargando_id) = id.to_string();
+        *bloquear(&self.s.estado_descarga) = texto.to_string();
+    }
+    pub(crate) fn post(&self, accion: &str, f: &[(&str, &str)], body: &[u8]) -> String {
+        let f: Vec<(String, String)> = f.iter().map(|(a, b)| (a.to_string(), b.to_string())).collect();
+        self.admin_post(accion, &f, body)
     }
 }

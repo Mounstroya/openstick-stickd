@@ -92,6 +92,10 @@ pub trait Vitrina: Send + Sync {
     /// Se llama al activar / desactivar el modo (afluencia arranca/para la captura aquí).
     fn start(&self) {}
     fn stop(&self) {}
+    /// ¿Mostrar su sección del panel ya abierta? (p.ej. hay una descarga en curso)
+    fn abierta(&self) -> bool {
+        false
+    }
     /// Una línea de estado para el panel (p.ej. "12 mensajes", "34 visitas hoy")
     fn resumen(&self) -> String {
         String::new()
