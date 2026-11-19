@@ -265,3 +265,10 @@ mod tests {
         assert!(!is_probe("192.168.4.1", "/"));
     }
 }
+
+/// ¿Este invitado ya tiene acceso a internet (aceptó "Continuar con internet" y no ha expirado)?
+/// ESQUELETO: lo implementa el módulo de internet para invitados. Hoy siempre es `false`.
+#[allow(dead_code)]
+pub fn cliente_tiene_internet(_ip: std::net::IpAddr) -> bool {
+    false
+}

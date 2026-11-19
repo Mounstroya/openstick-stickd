@@ -15,6 +15,7 @@ use std::path::PathBuf;
 
 pub mod afluencia;
 pub mod buzon;
+pub mod chat;
 pub mod portafolio;
 pub mod tarjeta;
 
@@ -114,6 +115,7 @@ pub fn todas() -> Vec<Box<dyn Vitrina>> {
         Box::new(portafolio::Portafolio::new()),
         Box::new(tarjeta::Tarjeta::new()),
         Box::new(buzon::Buzon::new()),
+        Box::new(chat::Chat::new()),
         Box::new(afluencia::Afluencia::new()),
     ]
 }
