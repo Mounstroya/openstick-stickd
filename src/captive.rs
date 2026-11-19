@@ -22,13 +22,13 @@ pub type Activa = Arc<Mutex<Option<usize>>>;
 const NFT: &str = r#"table inet stickd_captive
 delete table inet stickd_captive
 table inet stickd_captive {
-  chain pre {
+  chain entrada_nat {
     type nat hook prerouting priority dstnat; policy accept;
     iifname "wlan0" udp dport 53 dnat ip to 192.168.4.1:5353
     iifname "wlan0" tcp dport 53 dnat ip to 192.168.4.1:5353
     iifname "wlan0" tcp dport 80 dnat ip to 192.168.4.1:8080
   }
-  chain input {
+  chain entrada {
     type filter hook input priority -10; policy accept;
     iifname "wlan0" ct state established,related accept
     iifname "wlan0" udp dport { 67, 5353 } accept
@@ -36,7 +36,7 @@ table inet stickd_captive {
     iifname "wlan0" icmp type echo-request accept
     iifname "wlan0" drop
   }
-  chain fwd {
+  chain reenvio {
     type filter hook forward priority -10; policy accept;
     iifname "wlan0" drop
     oifname "wlan0" drop
