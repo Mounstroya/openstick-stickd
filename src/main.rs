@@ -285,6 +285,7 @@ fn main() {
     let mut last_config_exit: Option<Instant> = None;
     let mut last_wifi_try = Instant::now() - Duration::from_secs(3600);
     let mut last_lte_try = last_wifi_try;
+    let mut last_ap_try = Instant::now();
 
     loop {
         // ¿PC o powerbank?
@@ -334,6 +335,14 @@ fn main() {
         } else if cfg && applied.is_some_and(|a| matches!(a, Mode::Vitrina(_))) {
             // la vitrina se detuvo al entrar a configuración; al salir se re-aplica
             applied = None;
+        } else if let Mode::Vitrina(id) = eff {
+            // el AP no levantó (radio ocupado, NM lento…): reintentar cada 30 s
+            let needs_ap = vit_by_id(&vit, id).is_some_and(|(_, v)| v.usa_ap());
+            if needs_ap && !cfg && activa.lock().unwrap().is_none() && last_ap_try.elapsed() > Duration::from_secs(30) {
+                last_ap_try = Instant::now();
+                log(&format!("reintentando el AP de la vitrina {id}"));
+                start_vitrina(&vit, &activa, id);
+            }
         }
 
         // 1. USB: ¿la laptop comparte internet?
