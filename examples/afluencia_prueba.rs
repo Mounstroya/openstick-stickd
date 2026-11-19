@@ -7,6 +7,17 @@
 mod util;
 #[path = "../src/vitrina/mod.rs"]
 mod vitrina;
+/// Sustitutos: el ejemplo no compila el núcleo (portal cautivo ni red)
+mod captive {
+    pub fn cliente_tiene_internet(_ip: std::net::IpAddr) -> bool {
+        false
+    }
+}
+mod net {
+    pub fn internet() -> bool {
+        false
+    }
+}
 
 use std::collections::{BTreeMap, HashSet};
 use std::sync::atomic::Ordering;

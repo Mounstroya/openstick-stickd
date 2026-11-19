@@ -7,6 +7,11 @@
 //! Si no hay activo, se muestra la landing con el enlace y su QR (si hay enlace) o
 //! "aún no hay portafolio".
 //!
+//! Las copias NO se actualizan solas: el botón «↻ Sincronizar» las vuelve a bajar (si el stick
+//! tiene internet) y solo reemplaza la anterior si salió bien. Opción por copia `en_vivo`: si
+//! el invitado tiene internet (`captive::cliente_tiene_internet`), la entrada "/" redirige al
+//! URL original; los recursos y quien no tenga internet siguen con la copia offline.
+//!
 //! Datos de cada sitio en `sitios/<id>/.info` (clave=valor; oculto, nunca se sirve).
 //! Archivos en data_dir: `config.txt`, `visitas.txt`, `sitios/`.
 //! Versiones anteriores usaban `sitio/` (un solo sitio subido) y `copia/` (una sola copia):
@@ -102,6 +107,8 @@ struct Sitio {
     ts: i64,
     /// Nota de la última descarga ("3 recursos no se pudieron bajar")
     nota: String,
+    /// Solo copias: si el invitado tiene internet, la entrada ("/") lo manda al sitio real
+    en_vivo: bool,
     // calculados al listar
     archivos: usize,
     bytes: u64,
@@ -109,6 +116,14 @@ struct Sitio {
 
 impl Sitio {
     fn cargar(dir: &Path, id: &str) -> Sitio {
+        let mut s = Sitio::info(dir, id);
+        let a = listar(dir);
+        s.archivos = a.len();
+        s.bytes = a.iter().map(|x| x.1).sum();
+        s
+    }
+    /// Solo los datos de `.info` (sin recorrer los archivos: barato, para cada visita).
+    fn info(dir: &Path, id: &str) -> Sitio {
         let mut s = Sitio { id: id.to_string(), nombre: id.to_string(), ..Default::default() };
         for (k, v) in claves(&fs::read_to_string(dir.join(".info")).unwrap_or_default()) {
             match k.as_str() {
@@ -118,23 +133,22 @@ impl Sitio {
                 "fecha" => s.fecha = v,
                 "ts" => s.ts = v.parse().unwrap_or(0),
                 "nota" => s.nota = v,
+                "en_vivo" => s.en_vivo = v == "1",
                 _ => {}
             }
         }
-        let a = listar(dir);
-        s.archivos = a.len();
-        s.bytes = a.iter().map(|x| x.1).sum();
         s
     }
     fn guardar(&self, dir: &Path) {
         let t = format!(
-            "nombre={}\ntipo={}\norigen={}\nfecha={}\nts={}\nnota={}\n",
+            "nombre={}\ntipo={}\norigen={}\nfecha={}\nts={}\nnota={}\nen_vivo={}\n",
             una_linea(&self.nombre),
             if self.tipo == Tipo::Copia { "copia" } else { "subido" },
             una_linea(&self.origen),
             una_linea(&self.fecha),
             self.ts,
-            una_linea(&self.nota)
+            una_linea(&self.nota),
+            if self.en_vivo && self.tipo == Tipo::Copia { 1 } else { 0 }
         );
         escribir_atomico(&dir.join(".info"), &t);
     }
@@ -261,8 +275,16 @@ struct Compartido {
     curl: String,
 }
 
+/// ¿Este invitado tiene internet? (en producción: `captive::cliente_tiene_internet`)
+type InternetCliente = Box<dyn Fn(IpAddr) -> bool + Send + Sync>;
+/// ¿El stick tiene internet? (en producción: `net::internet`, hace ping)
+type InternetStick = Box<dyn Fn() -> bool + Send + Sync>;
+
 pub struct Portafolio {
     s: Arc<Compartido>,
+    /// Inyectables para poder probar sin red
+    cliente_internet: InternetCliente,
+    stick_internet: InternetStick,
 }
 
 fn bloquear<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -531,6 +553,9 @@ impl Portafolio {
                 curl: curl.to_string(),
                 dir,
             }),
+            cliente_internet: Box::new(crate::captive::cliente_tiene_internet),
+            // en tests no se hace ping: cada prueba elige si hay internet
+            stick_internet: if cfg!(test) { Box::new(|| true) } else { Box::new(crate::net::internet) },
         }
     }
 
@@ -656,6 +681,7 @@ impl Portafolio {
             s.tipo = Tipo::Subido;
             s.origen.clear();
             s.nota.clear();
+            s.en_vivo = false;
             (sitio.to_string(), s)
         };
         s.ts = visitas::ahora_local();
@@ -753,13 +779,25 @@ impl Portafolio {
     }
 
     /// Baja una copia de `url` como sitio: si ya hay una copia de ese mismo enlace (o se pasa
-    /// `sitio`), la actualiza; si no, crea un sitio nuevo con `nombre` (o el dominio).
+    /// `sitio`), la sincroniza (la reemplaza solo si la descarga salió bien); si no, crea un
+    /// sitio nuevo con `nombre` (o el dominio). Si el stick no tiene internet no intenta nada.
     fn iniciar_descarga(&self, url: String, sitio: &str, nombre: &str, usar: bool, sincrono: bool) -> String {
         if url.is_empty() {
             return "Primero escribe el enlace de tu página.".into();
         }
         let Some(u) = copia::Url::parse(&url) else { return "El enlace debe empezar con http:// o https://.".into() };
         let nombre: String = nombre.trim().chars().filter(|c| !c.is_control()).take(60).collect();
+        if self.s.descargando.load(Ordering::SeqCst) {
+            return "Ya hay una descarga en curso; espera a que termine.".into();
+        }
+        if !(self.stick_internet)() {
+            let m = "El stick no tiene internet ahora, así que no se intentó descargar; la copia que había sigue igual. \
+Conéctalo a internet (cable USB, WiFi o LTE) y vuelve a intentar.";
+            if !self.s.descargando.load(Ordering::SeqCst) {
+                *bloquear(&self.s.estado_descarga) = m.into();
+            }
+            return m.into();
+        }
         if self.s.descargando.swap(true, Ordering::SeqCst) {
             return "Ya hay una descarga en curso; espera a que termine.".into();
         }
@@ -780,13 +818,22 @@ impl Portafolio {
             self.s.descargando.store(false, Ordering::SeqCst);
             return format!("No hay espacio: los sitios guardados ya usan casi {} MB. Borra alguno primero.", self.s.max_total / MB);
         }
-        *bloquear(&self.s.descargando_id) = id.clone();
-        *bloquear(&self.s.estado_descarga) = "Empezando la descarga…".into();
-        let s = Arc::clone(&self.s);
         let nombre = match &previo {
             _ if !nombre.is_empty() => nombre,
             Some(p) => p.nombre.clone(),
             None => u.host.clone(),
+        };
+        // sincronizar = ya existía; se conserva su opción «en vivo»
+        let sincronizar = previo.is_some();
+        let en_vivo = previo.as_ref().map(|p| p.en_vivo).unwrap_or(false);
+        *bloquear(&self.s.descargando_id) = id.clone();
+        *bloquear(&self.s.estado_descarga) =
+            if sincronizar { format!("Sincronizando «{nombre}» con {url}…") } else { "Empezando la descarga…".into() };
+        let s = Arc::clone(&self.s);
+        let aviso_inicio = if sincronizar {
+            format!("Sincronizando «{}»… El avance se ve al inicio de la sección «Portafolio».", html(&nombre))
+        } else {
+            "Descarga iniciada. El avance se ve al inicio de la sección «Portafolio».".into()
         };
         let trabajo = move || {
             let op = copia::Opciones {
@@ -802,8 +849,9 @@ impl Portafolio {
             let msg = match r {
                 Ok(res) => {
                     let ts = visitas::ahora_local();
+                    let fecha = visitas::fecha_hora(ts);
                     let nota = if res.fallidos > 0 { format!("{} recursos no se pudieron bajar", res.fallidos) } else { String::new() };
-                    let si = Sitio { id: id.clone(), nombre: nombre.clone(), tipo: Tipo::Copia, origen: url.clone(), fecha: visitas::fecha_hora(ts), ts, nota: nota.clone(), ..Default::default() };
+                    let si = Sitio { id: id.clone(), nombre: nombre.clone(), tipo: Tipo::Copia, origen: url.clone(), fecha: fecha.clone(), ts, nota: nota.clone(), en_vivo, ..Default::default() };
                     si.guardar(&dest);
                     if usar {
                         let mut c = bloquear(&s.conf);
@@ -811,14 +859,17 @@ impl Portafolio {
                         c.guardar(&s.dir.join("config.txt"));
                     }
                     format!(
-                        "Copia lista: «{}» · {} archivos · {}{}{}",
+                        "{} «{}»: {} archivos · {} · {}{}{}",
+                        if sincronizar { "Sincronizado" } else { "Copia lista" },
                         nombre,
                         res.archivos,
                         tam_humano(res.bytes),
+                        fecha,
                         if nota.is_empty() { String::new() } else { format!(" · {nota}") },
-                        if usar { " · ya es la que ven los invitados" } else { "" }
+                        if usar && !sincronizar { " · ya es la que ven los invitados" } else { "" }
                     )
                 }
+                Err(e) if sincronizar => format!("No se pudo sincronizar «{nombre}»: {e}. Se conserva la copia anterior."),
                 Err(e) => format!("Error al descargar: {e}"),
             };
             *bloquear(&s.estado_descarga) = msg;
@@ -829,8 +880,59 @@ impl Portafolio {
             html(&bloquear(&self.s.estado_descarga))
         } else {
             std::thread::spawn(trabajo);
-            "Descarga iniciada. Abajo, en «Portafolio», se ve el avance. Necesita que el stick tenga internet.".into()
+            aviso_inicio
         }
+    }
+
+    /// Botón ↻ Sincronizar: vuelve a bajar la copia de un sitio desde su enlace de origen.
+    fn sincronizar(&self, sitio: &str) -> String {
+        let Some(d) = self.dir_sitio(sitio) else { return "Ese sitio ya no existe.".into() };
+        let s = Sitio::info(&d, sitio);
+        if s.tipo != Tipo::Copia || s.origen.is_empty() {
+            return "Ese sitio no es una copia de un enlace: no hay nada que sincronizar.".into();
+        }
+        self.iniciar_descarga(s.origen, sitio, "", false, self.sincrono())
+    }
+
+    /// Opción por sitio copia: «Usar el sitio en vivo cuando haya internet».
+    fn poner_en_vivo(&self, sitio: &str, si: bool) -> String {
+        let _g = bloquear(&self.s.subida);
+        let Some(d) = self.dir_sitio(sitio) else { return "Ese sitio ya no existe.".into() };
+        if self.ocupado(sitio) {
+            return "Ese sitio se está sincronizando; espera a que termine.".into();
+        }
+        let mut s = Sitio::info(&d, sitio);
+        if s.tipo != Tipo::Copia || s.origen.is_empty() {
+            return "Solo las copias de un enlace pueden usar el sitio en vivo.".into();
+        }
+        s.en_vivo = si;
+        s.guardar(&d);
+        if si {
+            format!(
+                "«{}»: los invitados con internet irán al sitio real ({}); los demás ven la copia offline.",
+                html(&s.nombre),
+                html(&s.origen)
+            )
+        } else {
+            format!("«{}»: todos los invitados ven la copia offline.", html(&s.nombre))
+        }
+    }
+
+    /// Si toca mandar a este invitado al sitio en vivo, el URL original. Solo en la página de
+    /// entrada ("/"): los recursos (css, imágenes…) siempre salen de la copia.
+    fn destino_en_vivo(&self, req: &GuestReq, path: &str) -> Option<String> {
+        if path != "/" || !matches!(req.method, "GET" | "HEAD") {
+            return None;
+        }
+        let activo = self.conf().activo;
+        let d = self.dir_sitio(&activo)?;
+        let s = Sitio::info(&d, &activo);
+        if s.tipo != Tipo::Copia || !s.en_vivo {
+            return None;
+        }
+        let u = copia::Url::parse(&s.origen)?;
+        // al final: puede costar algo (consulta al módulo de internet para invitados)
+        (self.cliente_internet)(req.client_ip).then(|| u.texto())
     }
 
     fn borrar_archivo(&self, sitio: &str, ruta: &str) -> String {
@@ -857,6 +959,41 @@ impl Portafolio {
     }
 }
 
+/// Botón ↻ Sincronizar de una copia (deshabilitado mientras haya una descarga en curso).
+fn boton_sincronizar(s: &Sitio, descargando: bool, desc_id: &str) -> String {
+    if s.tipo != Tipo::Copia || s.origen.is_empty() {
+        return String::new();
+    }
+    let (txt, dis) = match (descargando, desc_id == s.id) {
+        (true, true) => ("↻ Sincronizando…", " disabled"),
+        (true, false) => ("↻ Sincronizar", " disabled title=\"Ya hay una descarga en curso\""),
+        _ => ("↻ Sincronizar", ""),
+    };
+    format!(
+        "<form method=post action=\"{PREFIJO}/sincronizar#v-portafolio\" class=pf-bajar data-msg=\"Sincronizando «{n}»…\"><input type=hidden name=sitio value=\"{id}\"><button class=sec title=\"Vuelve a bajar la copia desde {o}\"{dis}>{txt}</button></form>",
+        n = html(&s.nombre),
+        id = html(&s.id),
+        o = html(&s.origen),
+    )
+}
+
+/// Casilla «Usar el sitio en vivo cuando haya internet» de una copia, con su explicación.
+fn opcion_en_vivo(s: &Sitio, ocupado: bool) -> String {
+    if s.tipo != Tipo::Copia || s.origen.is_empty() {
+        return String::new();
+    }
+    format!(
+        "<form method=post action=\"{PREFIJO}/en_vivo#v-portafolio\" class=vivo><input type=hidden name=sitio value=\"{id}\"><input type=hidden name=valor value=\"{v}\">\
+<label class=chk><input type=checkbox{chk}{dis} onchange=\"this.form.submit()\"> Usar el sitio en vivo cuando haya internet</label><noscript><button class=sec>Cambiar</button></noscript>\
+<span class=mut>Si el invitado tiene internet (activaste «Internet para invitados» y él lo aceptó), al entrar va a <span class=url>{o}</span>; si no, ve esta copia offline.</span></form>",
+        id = html(&s.id),
+        v = if s.en_vivo { "0" } else { "1" },
+        chk = if s.en_vivo { " checked" } else { "" },
+        dis = if ocupado { " disabled" } else { "" },
+        o = html(&s.origen),
+    )
+}
+
 impl Vitrina for Portafolio {
     fn id(&self) -> &'static str {
         "portafolio"
@@ -873,6 +1010,13 @@ impl Vitrina for Portafolio {
 
     fn guest(&self, req: &GuestReq) -> GuestResp {
         let path = pct_decode(req.path);
+        let path = if path.is_empty() { "/".to_string() } else { path };
+        if let Some(url) = self.destino_en_vivo(req, &path) {
+            self.contar(req.client_ip);
+            let mut r = GuestResp::redirect(&url);
+            r.headers.push(("Cache-Control".into(), "no-store".into()));
+            return r;
+        }
         let raiz = self.raiz_de(&self.conf().activo);
         let (r, pagina) = self.responder(raiz, &path, "");
         if pagina && r.status == 200 {
@@ -909,7 +1053,7 @@ impl Vitrina for Portafolio {
             }
         } else {
             // GET a una acción (p.ej. recargar tras un POST): de vuelta al panel
-            if matches!(ruta, "url" | "descargar" | "preparar" | "subir" | "usar" | "borrar" | "borrar_archivo" | "reiniciar_visitas") {
+            if matches!(ruta, "url" | "descargar" | "sincronizar" | "en_vivo" | "preparar" | "subir" | "usar" | "borrar" | "borrar_archivo" | "reiniciar_visitas") {
                 return Some(GuestResp::redirect("/"));
             }
             return None;
@@ -933,17 +1077,14 @@ impl Vitrina for Portafolio {
                 Ok(_) => "Enlace guardado.".into(),
                 Err(e) => e,
             },
+            "sincronizar" => self.sincronizar(campo(form, "sitio")),
+            "en_vivo" => self.poner_en_vivo(campo(form, "sitio"), campo(form, "valor") == "1"),
             "descargar" => {
                 let usar = campo(form, "usar") == "1";
                 let sitio = campo(form, "sitio");
                 if !sitio.is_empty() {
-                    // «Actualizar copia» de un sitio de la lista
-                    let Some(d) = self.dir_sitio(sitio) else { return "Ese sitio ya no existe.".into() };
-                    let s = Sitio::cargar(&d, sitio);
-                    if s.tipo != Tipo::Copia {
-                        return "Ese sitio no es una copia de un enlace.".into();
-                    }
-                    return self.iniciar_descarga(s.origen, sitio, "", usar, self.sincrono());
+                    // formato viejo del botón «Volver a descargar»: es lo mismo que sincronizar
+                    return self.sincronizar(sitio);
                 }
                 let url = if form.iter().any(|(k, _)| k == "url") {
                     match self.guardar_url(form) {
@@ -984,10 +1125,18 @@ impl Vitrina for Portafolio {
         let activo = sitios.iter().find(|s| s.id == c.activo && self.raiz_de(&s.id).is_some());
 
         let ahora = match activo {
-            Some(s) => format!("<b>{}</b> <span class=mut>({})</span>", html(&s.nombre), if s.tipo == Tipo::Copia { "copia de un enlace" } else { "sitio subido" }),
+            Some(s) if s.tipo == Tipo::Copia => format!(
+                "<b>{}</b> <span class=mut>(copia de <span class=url>{}</span> · sincronizada {}{})</span>",
+                html(&s.nombre),
+                html(&s.origen),
+                if s.fecha.is_empty() { "sin fecha".into() } else { html(&s.fecha) },
+                if s.en_vivo { " · en vivo para quien tenga internet" } else { "" }
+            ),
+            Some(s) => format!("<b>{}</b> <span class=mut>(sitio subido)</span>", html(&s.nombre)),
             None if !c.url.is_empty() => format!("<b>Página con tu enlace y código QR</b> <span class=mut>({})</span>", html(&c.url)),
             None => "<b>Nada todavía</b>: ven «aún no hay portafolio».".into(),
         };
+        let sinc_activo = activo.map(|s| boton_sincronizar(s, descargando, &desc_id)).unwrap_or_default();
 
         // ── visitas ──
         let (dia, hoy, tot, hist) = {
@@ -1033,14 +1182,8 @@ impl Vitrina for Portafolio {
             } else {
                 format!("<form method=post action={PREFIJO}/usar><input type=hidden name=sitio value=\"{id}\"><button>Usar este</button></form>")
             };
-            let actualizar = if s.tipo == Tipo::Copia && !descargando {
-                format!(
-                    "<form method=post action=\"{PREFIJO}/descargar#v-portafolio\" class=pf-bajar><input type=hidden name=sitio value=\"{id}\"><input type=hidden name=usar value=\"{}\"><button class=sec>Volver a descargar</button></form>",
-                    if es_activo { "1" } else { "0" }
-                )
-            } else {
-                String::new()
-            };
+            let actualizar = boton_sincronizar(s, descargando, &desc_id);
+            let vivo = opcion_en_vivo(s, ocupado);
             let borrar = if ocupado {
                 "<span class=mut>descargando…</span>".to_string()
             } else {
@@ -1068,7 +1211,7 @@ impl Vitrina for Portafolio {
             let mas = if archivos.len() > mostrar { format!("<li>… y {} más</li>", archivos.len() - mostrar) } else { String::new() };
             lista += &format!(
                 r#"<li class="sitio{cls}"><div class=nom><b>{nombre}</b>{tag}</div><div class=mut>{detalles}</div>
-<div class=fila>{usar}<a class="btn sec" href="{PREFIJO}/ver/{id}/" target=_blank rel=noopener>Vista previa</a>{actualizar}{borrar}</div>
+<div class=fila>{usar}<a class="btn sec" href="{PREFIJO}/ver/{id}/" target=_blank rel=noopener>Vista previa</a>{actualizar}{borrar}</div>{vivo}
 <details class=chica><summary>Ver archivos ({n})</summary><ul class=archivos>{filas}{mas}</ul></details></li>"#,
                 cls = if es_activo { " act" } else { "" },
                 nombre = html(&s.nombre),
@@ -1110,16 +1253,19 @@ impl Vitrina for Portafolio {
 .pf .barras small{{font-size:11px;color:var(--mut);line-height:1.2}}
 .pf .progreso{{border:1px solid var(--bd);border-radius:10px;padding:10px 12px;margin:10px 0}}.pf .progreso[hidden]{{display:none}}
 .pf progress{{width:100%;height:14px;margin:0 0 6px}}.pf #pf-subida,.pf #pf-estado{{font-size:14px;white-space:pre-wrap;word-break:break-word}}
-.pf .chk{{display:flex;gap:8px;align-items:center;margin:4px 0 10px}}.pf input[type=file]{{max-width:100%;margin:4px 0 10px}}
+.pf .chk{{display:flex;gap:8px;align-items:center;margin:4px 0 10px}}.pf form.vivo{{margin:6px 0 2px}}.pf form.vivo .chk{{margin:0 0 2px}}.pf input[type=file]{{max-width:100%;margin:4px 0 10px}}
 </style>
-<p class=ahora>Los invitados ven ahora: {ahora}<br><a class="btn sec" style="margin-top:8px" href="{PREFIJO}/vista/" target=_blank rel=noopener>Ver lo que ven ↗</a></p>
+<div class=ahora>Los invitados ven ahora: {ahora}<div class=fila><a class="btn sec" href="{PREFIJO}/vista/" target=_blank rel=noopener>Ver lo que ven ↗</a>{sinc_activo}</div></div>
+<div id=pf-progreso class=progreso data-activo={activo_n}{oculto}>
+<progress id=pf-barra{oculto_barra}></progress>
+<div id=pf-estado role=status aria-live=polite>{estado}</div></div>
 
 <h3>Sitios guardados en el stick</h3>
 <p class=mut style="margin-top:0">{n_sitios} · usan {usado} de {max_total} MB. Toca «Usar este» para elegir cuál ven los invitados.</p>
 <ul class=sitios>{lista}</ul>
 
 <h3>Copiar una página web al stick</h3>
-<p class=mut style="margin-top:0">El stick baja la página con sus imágenes y estilos para mostrarla sin internet. Cada copia se guarda como un sitio más.</p>
+<p class=mut style="margin-top:0">El stick baja la página con sus imágenes y estilos para mostrarla sin internet. Cada copia se guarda como un sitio más; no se actualiza sola: usa «↻ Sincronizar» cuando cambies tu página.</p>
 <form method=post action="{PREFIJO}/descargar#v-portafolio" class=pf-bajar>
 <label>Enlace de tu página<input type=url name=url value="{url}" placeholder="https://tu-sitio.com" maxlength=1000 inputmode=url autocomplete=off></label>
 <label>Nombre de la copia (opcional)<input type=text name=nombre maxlength=60 placeholder="si lo dejas vacío, se usa el dominio"></label>
@@ -1130,9 +1276,6 @@ impl Vitrina for Portafolio {
 <label>Frase corta<input type=text name=subtitulo value="{subtitulo}" placeholder="Diseño · Desarrollo · Fotografía" maxlength=140></label>
 </details>
 <div class=fila><button {dis_bajar}>Guardar y descargar copia</button><button formaction={PREFIJO}/url class=sec>Solo guardar el enlace</button></div></form>
-<div id=pf-progreso class=progreso data-activo={activo_n}{oculto}>
-<progress id=pf-barra{oculto_barra}></progress>
-<div id=pf-estado role=status aria-live=polite>{estado}</div></div>
 <p class=mut>Máx. 100 MB y 400 archivos por copia; tarda de segundos a unos minutos. Las páginas que arman su contenido con JavaScript desde internet pueden verse incompletas: revisa la vista previa.</p>
 
 <h3>Subir un sitio desde esta computadora</h3>
@@ -1178,7 +1321,7 @@ setTimeout(function(){{location.href='/#v-portafolio'}},mal.length?6000:1200)}};
 var pg=$('pf-progreso'),e=$('pf-estado'),barra=$('pf-barra');
 Array.prototype.forEach.call(document.querySelectorAll('form.pf-bajar'),function(fm){{fm.addEventListener('submit',function(ev){{
 if(ev.submitter&&ev.submitter.getAttribute('formaction'))return;
-pg.hidden=false;barra.hidden=false;e.textContent='Iniciando la descarga…'}})}});
+pg.hidden=false;barra.hidden=false;e.textContent=fm.dataset.msg||'Iniciando la descarga…';pg.scrollIntoView({{block:'nearest'}})}})}});
 if(pg.dataset.activo=='1'){{var iv=setInterval(async function(){{try{{
 var x=await (await fetch(P+'/estado',{{cache:'no-store'}})).text();var a=x.split('\n');e.textContent=a.slice(1).join('\n');
 if(a[0]!='1'){{clearInterval(iv);barra.hidden=true;setTimeout(function(){{location.href='/#v-portafolio'}},2500)}}}}catch(_){{}}}},1500)}}
@@ -1622,16 +1765,27 @@ mod tests {
         assert_eq!(get(&p, "/js/app.js", 1).content_type, "text/javascript; charset=utf-8");
         assert_eq!(get(&p, "/img/fondo.png", 1).body, vec![1, 2, 3]);
         let h = p.admin_html();
-        assert!(h.contains("Copia de") && h.contains("Volver a descargar"));
+        assert!(h.contains("Copia de") && h.contains("↻ Sincronizar"));
+        assert!(h.contains("/sincronizar#v-portafolio") && h.contains("Usar el sitio en vivo cuando haya internet"));
         assert!(h.contains("data-activo=0"));
         let e = texto(&p.admin_get("estado").unwrap());
         assert!(e.starts_with("0\nCopia lista"), "{e}");
 
-        // misma URL otra vez → actualiza el mismo sitio (no crea otro)
+        // ↻ Sincronizar: vuelve a bajar el mismo sitio (no crea otro) y conserva «en vivo»
+        assert!(p.admin_post("en_vivo", &kv(&[("sitio", "mi-copia"), ("valor", "1")]), &[]).contains("sitio real"));
+        let msg = p.admin_post("sincronizar", &kv(&[("sitio", "mi-copia")]), &[]);
+        assert!(msg.starts_with("Sincronizado «Mi copia»: 8 archivos · 415 B · "), "{msg}");
+        assert!(msg.contains(&visitas::fecha_hora(visitas::ahora_local())[..10]), "lleva la fecha: {msg}");
+        let c = p.sitios().into_iter().find(|s| s.id == "mi-copia").unwrap();
+        assert!(c.en_vivo && c.tipo == Tipo::Copia, "la opción en vivo sobrevive a la sincronización");
+        let e = texto(&p.admin_get("estado").unwrap());
+        assert!(e.starts_with("0\nSincronizado"), "{e}");
+        // el botón viejo «Volver a descargar» hace lo mismo
         let msg = p.admin_post("descargar", &kv(&[("sitio", "mi-copia"), ("usar", "1")]), &[]);
-        assert!(msg.contains("Copia lista"), "{msg}");
+        assert!(msg.contains("Sincronizado"), "{msg}");
         let msg = p.admin_post("descargar", &kv(&[("url", &format!("{base}/yo")), ("usar", "0")]), &[]);
-        assert!(msg.contains("Copia lista") && msg.contains("Mi copia"), "{msg}");
+        assert!(msg.contains("Sincronizado") && msg.contains("Mi copia"), "{msg}");
+        assert!(p.admin_post("sincronizar", &kv(&[("sitio", &sub)]), &[]).contains("no es una copia"));
         assert_eq!(p.sitios().len(), 2);
         // la de un sitio subido no se puede «volver a descargar»
         assert!(p.admin_post("descargar", &kv(&[("sitio", &sub)]), &[]).contains("no es una copia"));
@@ -1639,15 +1793,156 @@ mod tests {
         // falla limpia: no borra la copia buena
         let _ = std::process::Command::new("/usr/bin/curl").args(["-s", &format!("{base}/fin")]).output();
         hilo.join().unwrap();
-        let msg = p.admin_post("descargar", &kv(&[("sitio", "mi-copia")]), &[]);
-        assert!(msg.contains("Error al descargar"), "{msg}");
+        let msg = p.admin_post("sincronizar", &kv(&[("sitio", "mi-copia")]), &[]);
+        assert!(msg.contains("No se pudo sincronizar") && msg.contains("Se conserva la copia anterior"), "{msg}");
         assert!(texto(&get(&p, "/", 1)).contains("css/a.css"), "la copia anterior sigue");
+        assert!(p.sitios().into_iter().find(|s| s.id == "mi-copia").unwrap().en_vivo);
         assert_eq!(p.sitios().len(), 2);
         // una URL nueva que falla no deja un sitio vacío
         let msg = p.admin_post("descargar", &kv(&[("url", &format!("{base}/otra")), ("usar", "1")]), &[]);
         assert!(msg.contains("Error al descargar"), "{msg}");
         assert_eq!(p.sitios().len(), 2);
         assert_eq!(p.conf().activo, "mi-copia");
+    }
+
+    /// Crea a mano una copia ya descargada de `origen` (sin red) y devuelve su id.
+    fn copia_falsa(p: &Portafolio, id: &str, nombre: &str, origen: &str) -> String {
+        let d = p.sitios_dir().join(id);
+        fs::create_dir_all(d.join("css")).unwrap();
+        fs::write(d.join("index.html"), format!("<p>copia {id}</p>")).unwrap();
+        fs::write(d.join("css/a.css"), "a{}").unwrap();
+        let s = Sitio { id: id.into(), nombre: nombre.into(), tipo: Tipo::Copia, origen: origen.into(), fecha: "01/11/2026 10:00".into(), ts: 1, ..Default::default() };
+        s.guardar(&d);
+        id.to_string()
+    }
+
+    #[test]
+    fn boton_sincronizar_en_lista_y_arriba() {
+        let t = tmp("boton");
+        let p = Portafolio::with_dir(t.0.clone());
+        let c = copia_falsa(&p, "mi-web", "Mi web", "https://mi-web.com/");
+        let sub = nuevo(&p, "Subido");
+        subir(&p, &sub, "index.html", b"<p>s</p>");
+        usar(&p, &sub);
+        let h = p.admin_html();
+        // solo la copia tiene botón (en su fila); arriba no, porque el activo es un sitio subido
+        assert_eq!(h.matches("↻ Sincronizar</button>").count(), 1, "{h}");
+        assert!(h.contains("name=sitio value=\"mi-web\"><button class=sec title=\"Vuelve a bajar la copia desde https://mi-web.com/\">↻ Sincronizar"));
+        assert!(!h.contains("Volver a descargar"));
+        // con la copia activa, el botón aparece también arriba, junto al sitio activo
+        usar(&p, &c);
+        let h = p.admin_html();
+        assert_eq!(h.matches("↻ Sincronizar</button>").count(), 2);
+        let arriba = &h[h.find("Los invitados ven ahora").unwrap()..h.find("Sitios guardados en el stick").unwrap()];
+        assert!(arriba.contains("↻ Sincronizar") && arriba.contains("sincronizada 01/11/2026 10:00"), "{arriba}");
+        assert!(arriba.contains("id=pf-progreso"), "la barra de progreso queda a la vista, arriba");
+        // durante una descarga: deshabilitado, y en el sitio que se baja dice «Sincronizando…»
+        p.simular_descarga(&c, "Descargando archivo 2 de 5");
+        let h = p.admin_html();
+        assert!(h.contains("disabled>↻ Sincronizando…</button>") && h.contains("data-activo=1"));
+        assert!(p.admin_post("sincronizar", &kv(&[("sitio", &c)]), &[]).contains("Ya hay una descarga"));
+        assert!(p.admin_post("en_vivo", &kv(&[("sitio", &c), ("valor", "1")]), &[]).contains("espera"));
+        // ids malos o sitios que no son copia
+        assert!(p.admin_post("sincronizar", &kv(&[("sitio", "../x")]), &[]).contains("ya no existe"));
+        assert!(p.admin_post("sincronizar", &kv(&[("sitio", &sub)]), &[]).contains("no es una copia"));
+        assert_eq!(header(&p.admin_get("sincronizar").unwrap(), "Location"), Some("/"));
+    }
+
+    #[test]
+    fn sin_internet_no_intenta_sincronizar() {
+        let t = tmp("sinred");
+        // curl inexistente: si se intentara bajar, saldría «no pude ejecutar curl»
+        let mut p = Portafolio::con_limites(t.0.clone(), 25 * MB, 300 * MB, "/no/existe/curl");
+        let pings = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let n = Arc::clone(&pings);
+        p.stick_internet = Box::new(move || {
+            n.fetch_add(1, Ordering::SeqCst);
+            false
+        });
+        let c = copia_falsa(&p, "mi-web", "Mi web", "https://mi-web.com/");
+        usar(&p, &c);
+        let antes = p.sitios();
+        let msg = p.admin_post("sincronizar", &kv(&[("sitio", &c)]), &[]);
+        assert!(msg.starts_with("El stick no tiene internet ahora") && msg.contains("no se intentó"), "{msg}");
+        assert!(!msg.contains("curl") && !msg.contains("Error"), "{msg}");
+        assert_eq!(pings.load(Ordering::SeqCst), 1);
+        assert!(!p.s.descargando.load(Ordering::SeqCst));
+        assert!(!t.0.join("sitios/mi-web.nueva").exists(), "ni siquiera crea la carpeta temporal");
+        assert_eq!(texto(&get(&p, "/", 1)), "<p>copia mi-web</p>", "la copia sigue intacta");
+        let despues = p.sitios();
+        assert_eq!((despues[0].archivos, &despues[0].fecha), (antes[0].archivos, &antes[0].fecha));
+        // el aviso queda junto a la barra de progreso
+        assert!(texto(&p.admin_get("estado").unwrap()).starts_with("0\nEl stick no tiene internet"));
+        assert!(p.admin_html().contains("El stick no tiene internet ahora"));
+        // también al copiar un enlace nuevo
+        let msg = p.admin_post("descargar", &kv(&[("url", "https://otra.com/"), ("nombre", "Otra")]), &[]);
+        assert!(msg.contains("no tiene internet"), "{msg}");
+        assert_eq!(p.sitios().len(), 1);
+        // con internet sí intenta (y aquí falla porque no hay curl): conserva la copia
+        p.stick_internet = Box::new(|| true);
+        let msg = p.admin_post("sincronizar", &kv(&[("sitio", &c)]), &[]);
+        assert!(msg.contains("No se pudo sincronizar «Mi web»") && msg.contains("curl"), "{msg}");
+        assert_eq!(texto(&get(&p, "/", 1)), "<p>copia mi-web</p>");
+    }
+
+    #[test]
+    fn en_vivo_redirige_solo_la_entrada_si_el_invitado_tiene_internet() {
+        let t = tmp("envivo");
+        let mut p = Portafolio::with_dir(t.0.clone());
+        // simulado: solo el invitado .7 aceptó «Internet para invitados»
+        p.cliente_internet = Box::new(|ip| ip == IpAddr::V4(Ipv4Addr::new(192, 168, 4, 7)));
+        let c = copia_falsa(&p, "mi-web", "Mi web", "https://mi-web.com/hola?x=1");
+        usar(&p, &c);
+        // apagada por defecto: todos ven la copia
+        assert!(!p.sitios()[0].en_vivo);
+        assert_eq!(texto(&get(&p, "/", 7)), "<p>copia mi-web</p>");
+        assert!(p.admin_html().contains("Usar el sitio en vivo cuando haya internet"));
+        assert!(!p.admin_html().contains("type=checkbox checked onchange"));
+
+        assert!(p.admin_post("en_vivo", &kv(&[("sitio", &c), ("valor", "1")]), &[]).contains("sitio real"));
+        assert!(p.admin_html().contains("type=checkbox checked onchange"));
+        assert!(p.admin_html().contains("en vivo para quien tenga internet"));
+        // con internet: la entrada va al sitio real
+        for entrada in ["/", ""] {
+            let r = get(&p, entrada, 7);
+            assert_eq!((r.status, header(&r, "Location")), (302, Some("https://mi-web.com/hola?x=1")), "{entrada:?}");
+            assert_eq!(header(&r, "Cache-Control"), Some("no-store"));
+        }
+        // …pero los recursos y otras rutas siguen saliendo de la copia
+        let r = get(&p, "/css/a.css", 7);
+        assert_eq!((r.status, texto(&r).as_str()), (200, "a{}"));
+        assert_eq!(texto(&get(&p, "/index.html", 7)), "<p>copia mi-web</p>");
+        // sin internet: la copia offline
+        assert_eq!(texto(&get(&p, "/", 8)), "<p>copia mi-web</p>");
+        // la vista previa del panel nunca redirige
+        assert_eq!(p.admin_get("vista/").unwrap().status, 200);
+        // la visita redirigida cuenta
+        assert!(p.resumen().starts_with("2 visitas hoy"), "{}", p.resumen());
+        // POST a "/" no se redirige
+        let r = p.guest(&GuestReq { method: "POST", path: "/", query: "", host: "x", user_agent: "", content_type: "", body: &[], client_ip: ip(7) });
+        assert_eq!(r.status, 200);
+
+        // persiste y se puede apagar
+        let mut p2 = Portafolio::with_dir(t.0.clone());
+        p2.cliente_internet = Box::new(|_| true);
+        assert_eq!(get(&p2, "/", 9).status, 302);
+        assert!(p2.admin_post("en_vivo", &kv(&[("sitio", &c), ("valor", "0")]), &[]).contains("copia offline"));
+        assert_eq!(texto(&get(&p2, "/", 9)), "<p>copia mi-web</p>");
+
+        // solo aplica al sitio ACTIVO y solo a copias
+        p2.admin_post("en_vivo", &kv(&[("sitio", &c), ("valor", "1")]), &[]);
+        let sub = nuevo(&p2, "Subido");
+        subir(&p2, &sub, "index.html", b"<p>s</p>");
+        usar(&p2, &sub);
+        assert_eq!(texto(&get(&p2, "/", 9)), "<p>s</p>");
+        assert!(p2.admin_post("en_vivo", &kv(&[("sitio", &sub), ("valor", "1")]), &[]).contains("Solo las copias"));
+        assert!(!fs::read_to_string(t.0.join("sitios/subido/.info")).unwrap().contains("en_vivo=1"));
+        // reemplazar una copia por archivos subidos le quita «en vivo»
+        usar(&p2, &c);
+        assert_eq!(get(&p2, "/", 9).status, 302);
+        assert!(p2.admin_post("preparar", &kv(&[("sitio", &c)]), &[]).starts_with("OK"));
+        subir(&p2, &c, "index.html", b"<p>nuevo</p>");
+        assert_eq!(texto(&get(&p2, "/", 9)), "<p>nuevo</p>");
     }
 }
 
