@@ -84,6 +84,11 @@ pub trait Vitrina: Send + Sync {
     /// subir archivos con fetch(...,{body:file})); `form` es el cuerpo decodificado si era
     /// x-www-form-urlencoded, o la query string si no. Devuelve un mensaje para el usuario.
     fn admin_post(&self, accion: &str, form: &[(String, String)], body: &[u8]) -> String;
+    /// GET /vitrina/<id>/<ruta> en el panel de ADMIN (p.ej. descargar un archivo del buzón,
+    /// ver una imagen subida). `None` = 404.
+    fn admin_get(&self, _ruta: &str) -> Option<GuestResp> {
+        None
+    }
     /// Se llama al activar / desactivar el modo (afluencia arranca/para la captura aquí).
     fn start(&self) {}
     fn stop(&self) {}
