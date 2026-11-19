@@ -1,8 +1,8 @@
 //! Núcleo del portal cautivo para las vitrinas:
-//!   - DNS falso en :5353 (todo nombre → 192.168.4.1) para que el teléfono "vea" un portal
+//!   - DNS falso en :5300 (todo nombre → 192.168.4.1) para que el teléfono "vea" un portal
 //!   - servidor HTTP de invitados en :8080 que atiende las URLs de detección y pasa el resto
 //!     al módulo activo
-//!   - reglas nft (tabla inet stickd_captive) SOLO sobre wlan0: DNS→5353, HTTP→8080, y todo
+//!   - reglas nft (tabla inet stickd_captive) SOLO sobre wlan0: DNS→5300, HTTP→8080, y todo
 //!     lo demás bloqueado (sin SSH, sin panel de admin, sin reenvío a internet), salvo los
 //!     invitados con internet concedido (ver invitados.rs): ellos salen a internet, nunca a
 //!     redes privadas ni a puertos del stick que no sean los del portal
@@ -17,7 +17,8 @@ use tiny_http::{Header, Response, Server};
 
 pub const AP_IP: [u8; 4] = [192, 168, 4, 1];
 const GUEST_PORT: u16 = 8080;
-const DNS_PORT: u16 = 5353;
+// 5300 y no 5353: 5353 es mDNS, que los celulares usan entre ellos (WebRTC de "Compartir archivos")
+const DNS_PORT: u16 = 5300;
 
 /// Índice del módulo activo en el vector de vitrinas (None = ninguna vitrina con AP activa).
 pub type Activa = Arc<Mutex<Option<usize>>>;
@@ -49,14 +50,14 @@ table inet {t} {{
     type nat hook prerouting priority dstnat; policy accept;
     iifname {ap_set} ip saddr @{s} ip daddr 192.168.4.1 meta l4proto {{ tcp, udp }} th dport 53 dnat ip to {dns}
     iifname {ap_set} ip saddr @{s} ip daddr != 192.168.4.1 accept
-    iifname {ap_set} udp dport 53 dnat ip to 192.168.4.1:5353
-    iifname {ap_set} tcp dport 53 dnat ip to 192.168.4.1:5353
+    iifname {ap_set} udp dport 53 dnat ip to 192.168.4.1:5300
+    iifname {ap_set} tcp dport 53 dnat ip to 192.168.4.1:5300
     iifname {ap_set} tcp dport 80 dnat ip to 192.168.4.1:8080
   }}
   chain entrada {{
     type filter hook input priority -10; policy accept;
     iifname {ap_set} ct state established,related accept
-    iifname {ap_set} udp dport {{ 67, 5353 }} accept
+    iifname {ap_set} udp dport {{ 67, 5300 }} accept
     iifname {ap_set} tcp dport 8080 accept
     iifname {ap_set} icmp type echo-request accept
     iifname {ap_set} drop
@@ -230,10 +231,17 @@ fn guest_server(vitrinas: Arc<Vec<Box<dyn Vitrina>>>, activa: Activa) {
                 invitados::sonda_exito(&host, &path)
             } else if invitados::sonda_directa(cliente) {
                 GuestResp::redirect(&format!("http://192.168.4.1{}", invitados::RUTA))
+            } else if es_sonda_apple(&host, &path) && ya_vio_la_pagina(cliente) {
+                // iPhone que ya vio la vitrina: "Success" hace que el botón diga «Listo» y
+                // que el teléfono se quede conectado (y pueda abrir Safari en 192.168.4.1)
+                GuestResp::html("<HTML><HEAD><TITLE>Success</TITLE></HEAD><BODY>Success</BODY></HTML>")
             } else {
                 GuestResp::redirect("http://192.168.4.1/")
             }
         } else {
+            if method == "GET" && path == "/" {
+                marcar_visto(cliente);
+            }
             let mut body = Vec::new();
             let limit = v.max_body() as u64 + 1;
             let _ = req.as_reader().take(limit).read_to_end(&mut body);
@@ -246,6 +254,28 @@ fn guest_server(vitrinas: Arc<Vec<Box<dyn Vitrina>>>, activa: Activa) {
         };
         let _ = req.respond(to_tiny(resp));
     }
+}
+
+/// IPs que ya cargaron la página de entrada de la vitrina (para la sonda de Apple), 1 h.
+static VISTOS: Mutex<Option<std::collections::HashMap<IpAddr, std::time::Instant>>> = Mutex::new(None);
+const VISTO_DURA: std::time::Duration = std::time::Duration::from_secs(3600);
+
+fn marcar_visto(ip: IpAddr) {
+    let mut g = VISTOS.lock().unwrap();
+    let m = g.get_or_insert_with(Default::default);
+    m.retain(|_, t| t.elapsed() < VISTO_DURA);
+    if m.len() < 4096 {
+        m.insert(ip, std::time::Instant::now());
+    }
+}
+
+fn ya_vio_la_pagina(ip: IpAddr) -> bool {
+    VISTOS.lock().unwrap().as_ref().and_then(|m| m.get(&ip)).is_some_and(|t| t.elapsed() < VISTO_DURA)
+}
+
+fn es_sonda_apple(host: &str, path: &str) -> bool {
+    let h = host.split(':').next().unwrap_or("").to_ascii_lowercase();
+    h.ends_with("captive.apple.com") || h.ends_with("apple.com") && path == "/library/test/success.html" || path == "/hotspot-detect.html"
 }
 
 pub fn to_tiny(r: GuestResp) -> Response<std::io::Cursor<Vec<u8>>> {
@@ -272,7 +302,7 @@ pub fn ap_up(ssid: &str) -> bool {
         let ok = run(
             "nmcli",
             &[
-                "con", "add", "type", "wifi", "ifname", "wlan0", "con-name", "vitrina", "ssid", ssid, "802-11-wireless.mode", "ap",
+                "con", "add", "type", "wifi", "ifname", "wlan0", "con-name", "vitrina", "ssid", ssid, "802-11-wireless.mode", "ap", "802-11-wireless.ap-isolation", "false",
                 "802-11-wireless.band", "bg", "ipv4.method", "shared", "ipv4.addresses", "192.168.4.1/24", "ipv6.method", "ignore",
                 "connection.autoconnect", "no", "connection.autoconnect-priority", "-10",
             ],
@@ -283,7 +313,8 @@ pub fn ap_up(ssid: &str) -> bool {
             return false;
         }
     } else {
-        let _ = run("nmcli", &["con", "modify", "vitrina", "802-11-wireless.ssid", ssid]);
+        // sin aislamiento entre clientes: "Compartir archivos" va celular↔celular por el AP
+        let _ = run("nmcli", &["con", "modify", "vitrina", "802-11-wireless.ssid", ssid, "802-11-wireless.ap-isolation", "false"]);
     }
     run("nmcli", &["--wait", "30", "con", "up", "vitrina"]).0
 }
