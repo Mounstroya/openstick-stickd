@@ -1,0 +1,24 @@
+#!/bin/sh
+# Comparte el internet de esta laptop con el stick OpenStick cuando se conecta por USB.
+# Se identifica al stick por la MAC fija del gadget ECM. Instalado por Claude (2026-11-18).
+IF="$1"; ACTION="$2"
+STICK_MAC="2a:85:da:41:eb:f9"
+[ -n "$IF" ] && [ "$(cat /sys/class/net/$IF/address 2>/dev/null)" = "$STICK_MAC" ] || exit 0
+IPT=/usr/sbin/iptables
+C="-m comment --comment openstick"
+reglas() {  # $1 = -C | -I | -D
+  op=$1
+  $IPT $op FORWARD $( [ "$op" = "-I" ] && echo 1 ) -i "$IF" $C -j ACCEPT
+  $IPT $op FORWARD $( [ "$op" = "-I" ] && echo 1 ) -o "$IF" -m conntrack --ctstate RELATED,ESTABLISHED $C -j ACCEPT
+  $IPT -t nat $( [ "$op" = "-I" ] && echo -A || echo $op ) POSTROUTING -s 192.168.5.0/24 ! -o "$IF" $C -j MASQUERADE
+}
+case "$ACTION" in
+  up)
+    sysctl -qw net.ipv4.ip_forward=1
+    reglas -C 2>/dev/null || reglas -I
+    logger -t openstick "compartiendo internet con el stick por $IF" ;;
+  down|pre-down)
+    while reglas -C 2>/dev/null; do reglas -D; done
+    logger -t openstick "deje de compartir internet con el stick ($IF)" ;;
+esac
+exit 0
