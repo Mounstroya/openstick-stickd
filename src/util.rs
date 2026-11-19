@@ -113,7 +113,7 @@ mod tests {
     }
     #[test]
     fn campos_nmcli() {
-        assert_eq!(nm_fields(r"Steren COM\:8400:97:WPA2"), vec!["Steren COM:8400", "97", "WPA2"]);
+        assert_eq!(nm_fields(r"Mi Red\:Casa:97:WPA2"), vec!["Mi Red:Casa", "97", "WPA2"]);
     }
     #[test]
     fn escapa_html() {
