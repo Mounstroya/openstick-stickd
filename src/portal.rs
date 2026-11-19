@@ -50,6 +50,11 @@ pub fn spawn(state: Arc<Mutex<State>>, vit: Vitrinas, activa: Activa) {
             let (path, query) = url.split_once('?').unwrap_or((url.as_str(), ""));
             let (path, query) = (path.to_string(), query.to_string());
             let is_post = *req.method() == Method::Post;
+            if is_post && !same_origin(&req) {
+                // anti-CSRF: una página web cualquiera no puede mandar formularios al panel
+                let _ = req.respond(Response::from_string("origen no permitido").with_status_code(403));
+                continue;
+            }
             let mut body = Vec::new();
             if is_post {
                 let lim = if path.starts_with("/vitrina/") { MAX_UPLOAD } else { 8192 };
@@ -90,6 +95,22 @@ pub fn spawn(state: Arc<Mutex<State>>, vit: Vitrinas, activa: Activa) {
             let _ = req.respond(resp);
         }
     });
+}
+
+/// El POST debe venir del propio panel: Origin (o Referer) con el mismo host que la petición.
+/// Sin ninguno de los dos (curl, scripts locales) se acepta: los navegadores siempre mandan Origin en POST.
+fn same_origin(req: &tiny_http::Request) -> bool {
+    let get = |n: &'static str| req.headers().iter().find(|h| h.field.equiv(n)).map(|h| h.value.as_str().to_string());
+    let host = get("Host").unwrap_or_default();
+    let src = get("Origin").filter(|o| o != "null").or_else(|| get("Referer"));
+    match src {
+        None => get("Origin").is_none(), // Origin: null (sandbox, data:) se rechaza
+        Some(o) => {
+            let rest = o.split_once("://").map(|(_, r)| r).unwrap_or("");
+            let o_host = rest.split('/').next().unwrap_or("");
+            !host.is_empty() && o_host.eq_ignore_ascii_case(&host)
+        }
+    }
 }
 
 fn hdr(k: &str, v: &str) -> Header {
