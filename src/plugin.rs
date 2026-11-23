@@ -23,9 +23,13 @@ use crate::Vitrinas;
 use std::ffi::{CStr, CString};
 use std::os::raw::{c_char, c_int, c_void};
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
-const ABI: u32 = 2;
+const ABI: u32 = 3;
+
+/// Handle a la lista de vitrinas, para que la API del host pueda recargar plugins.
+/// Lo fija `cargar_todas` al arrancar.
+static VIT: OnceLock<Vitrinas> = OnceLock::new();
 const DIR: &str = "/var/lib/stickd/plugins";
 const MAX_SO: u64 = 8 * 1024 * 1024;
 
@@ -260,6 +264,7 @@ pub struct Host {
     pub sms_list_json: extern "C" fn() -> *mut c_char,
     pub led: extern "C" fn(*const c_char, *const c_char),
     pub guests_json: extern "C" fn() -> *mut c_char,
+    pub recargar: extern "C" fn() -> c_int,
 }
 
 // El host es estático e inmutable; sus punteros son funciones del proceso.
@@ -276,6 +281,7 @@ pub static HOST: Host = Host {
     sms_list_json: host_sms_list_json,
     led: host_led,
     guests_json: host_guests_json,
+    recargar: host_recargar,
 };
 
 /// String de Rust → char* que el plugin libera con host->free_string.
@@ -446,6 +452,20 @@ extern "C" fn host_led(cual: *const c_char, patron: *const c_char) {
     }
 }
 
+/// Carga los .so nuevos de la carpeta de plugins (los que aún no estén cargados).
+/// Devuelve cuántos se cargaron, o -1 si el stick aún no está listo.
+extern "C" fn host_recargar() -> c_int {
+    match VIT.get() {
+        Some(vit) => {
+            let antes = vit.lock().map(|g| g.len()).unwrap_or(0);
+            let _ = cargar_nuevos(vit);
+            let despues = vit.lock().map(|g| g.len()).unwrap_or(antes);
+            (despues.saturating_sub(antes)) as c_int
+        }
+        None => -1,
+    }
+}
+
 extern "C" fn host_guests_json() -> *mut c_char {
     use crate::util::json;
     // vecinos en la interfaz del AP, filtrados a la subred de la vitrina (192.168.4.x)
@@ -578,6 +598,7 @@ fn cargar_path(vit: &Vitrinas, path: &Path) -> Result<String, String> {
 
 /// Al arrancar: carga todos los .so que haya en la carpeta de plugins.
 pub fn cargar_todas(vit: &Vitrinas) {
+    let _ = VIT.set(vit.clone());
     let _ = std::fs::create_dir_all(dir());
     for p in listar_so() {
         let nombre = p.file_name().and_then(|x| x.to_str()).unwrap_or("?");

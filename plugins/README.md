@@ -65,6 +65,13 @@ gcc -shared -fPIC -O2 -o mi.so mi.c
 [`../plugins-comunidad/`](../plugins-comunidad/), push (or open a PR), and download the
 compiled `.so` from the Actions run. See that folder's README.
 
+**On the stick itself, from the panel** — the
+[`Compilador de plugins`](../plugin-ejemplo/compilador.c) plugin lets you paste C source
+in the admin panel and compiles + loads it on the device, no PC needed. It needs `gcc` on
+the stick (`sudo apt install gcc`) and `abi.h` at `/var/lib/stickd/compilador/abi.h`.
+Don't use `tcc`: its aarch64 backend (0.9.27) miscompiles `stickd_info` and the plugin
+segfaults on load — use `gcc`/`cc`.
+
 ## Installing / removing
 
 - **Panel:** `Plugins → Subir` (pick the `.so`). It loads in place, no restart.

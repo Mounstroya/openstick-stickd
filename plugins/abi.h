@@ -49,7 +49,7 @@
 #include <stdint.h>
 #include <stdbool.h>
 
-#define STICKD_ABI_VERSION 2
+#define STICKD_ABI_VERSION 3
 
 /* ------------------------------------------------------------------ */
 /* API del host: funciones del stick que tu plugin puede llamar.      */
@@ -95,6 +95,11 @@ typedef struct stickd_host {
     /* Invitados conectados al AP de la vitrina, JSON:
        [{"ip":"192.168.4.x","mac":"...","internet":bool}]. */
     char *(*guests_json)(void);
+
+    /* Carga los .so nuevos de /var/lib/stickd/plugins/ (los que aún no estén
+       cargados). Útil para un plugin que escriba otro .so ahí (p.ej. un
+       compilador). Devuelve cuántos se cargaron, o -1 si no está disponible. */
+    int (*recargar)(void);
 } stickd_host;
 
 /* ------------------------------------------------------------------ */
