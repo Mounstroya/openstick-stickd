@@ -459,9 +459,13 @@ fn leer(rq: &mut tiny_http::Request, max: usize) -> (String, String, String, Str
 }
 
 /// Igual que el servidor de invitados de captive.rs (sin sondas de portal cautivo).
-fn servir_invitados(puerto: u16, vit: Vitrinas, idx: usize) {
+fn servir_invitados(puerto: u16, vit: Vitrinas, id: &str) {
     let server = tiny_http::Server::http(("127.0.0.1", puerto)).unwrap();
-    let v = &vit[idx];
+    let v = {
+        let g = vit.lock().unwrap();
+        g.iter().find(|x| x.id() == id).cloned()
+    };
+    let Some(v) = v else { return };
     for mut rq in server.incoming_requests() {
         let cliente = rq.remote_addr().map(|a| a.ip()).unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST));
         let (method, path, query, host, ua, ct, body) = leer(&mut rq, v.max_body());
@@ -487,7 +491,11 @@ fn servir_panel(puerto: u16, st: Arc<Mutex<State>>, vit: Vitrinas) {
             GuestResp::bytes("application/json; charset=utf-8", ESTADO_JSON.as_bytes().to_vec())
         } else if let (Some(rest), "GET") = (path.strip_prefix("/vitrina/"), method.as_str()) {
             let (id, sub) = rest.split_once('/').unwrap_or((rest, ""));
-            vit.iter().find(|v| v.id() == id).and_then(|v| v.admin_get(sub)).unwrap_or_else(GuestResp::not_found)
+            let v = {
+                let g = vit.lock().unwrap();
+                g.iter().find(|x| x.id() == id).cloned()
+            };
+            v.and_then(|v| v.admin_get(sub)).unwrap_or_else(GuestResp::not_found)
         } else if method == "GET" && path == "/" {
             let abrir = qv("abrir");
             let abrir: Option<&str> = ["invitados", "portafolio", "tarjeta", "buzon", "chat", "compartir", "afluencia"].into_iter().find(|x| *x == abrir);
@@ -515,22 +523,22 @@ fn capturas_servidor() {
             (Ipv4Addr::new(192, 168, 4, 37), "iPhone", "", 6, 112_400_000),
         ],
     );
-    let vit: Vitrinas = Arc::new(vec![
-        Box::new(llenar_portafolio(&raiz.join("portafolio"))),
-        Box::new(llenar_tarjeta(&raiz.join("tarjeta"))),
-        Box::new(llenar_buzon(&raiz.join("buzon"))),
-        Box::new(llenar_chat(&raiz.join("chat"))),
-        Box::new(llenar_compartir(&raiz.join("compartir"))),
-        Box::new(llenar_afluencia(&raiz.join("afluencia"))),
-    ]);
-    let landing: Vitrinas = Arc::new(vec![Box::new(llenar_landing(&raiz.join("landing")))]);
+    let vit: Vitrinas = Arc::new(Mutex::new(vec![
+        Arc::new(llenar_portafolio(&raiz.join("portafolio"))),
+        Arc::new(llenar_tarjeta(&raiz.join("tarjeta"))),
+        Arc::new(llenar_buzon(&raiz.join("buzon"))),
+        Arc::new(llenar_chat(&raiz.join("chat"))),
+        Arc::new(llenar_compartir(&raiz.join("compartir"))),
+        Arc::new(llenar_afluencia(&raiz.join("afluencia"))),
+    ]));
+    let landing: Vitrinas = Arc::new(Mutex::new(vec![Arc::new(llenar_landing(&raiz.join("landing")))]));
 
     let mut hilos = Vec::new();
-    for (i, puerto) in [(0, p + 1), (1, p + 3), (2, p + 4), (3, p + 5), (4, p + 6)] {
+    for (id, puerto) in [("portafolio", p + 1), ("tarjeta", p + 3), ("buzon", p + 4), ("chat", p + 5), ("compartir", p + 6)] {
         let v = vit.clone();
-        hilos.push(std::thread::spawn(move || servir_invitados(puerto, v, i)));
+        hilos.push(std::thread::spawn(move || servir_invitados(puerto, v, id)));
     }
-    hilos.push(std::thread::spawn(move || servir_invitados(p + 2, landing, 0)));
+    hilos.push(std::thread::spawn(move || servir_invitados(p + 2, landing, "portafolio")));
     let st = estado();
     let v = vit.clone();
     hilos.push(std::thread::spawn(move || servir_panel(p, st, v)));

@@ -57,7 +57,8 @@ pub fn spawn(state: Arc<Mutex<State>>, vit: Vitrinas, activa: Activa) {
             }
             let mut body = Vec::new();
             if is_post {
-                let lim = if path.starts_with("/vitrina/") { MAX_UPLOAD } else { 8192 };
+                // los plugins .so pueden pesar unos cuantos MB (Go, Zig…); se topan a 8 MB
+                let lim = if path.starts_with("/vitrina/") { MAX_UPLOAD } else if path.starts_with("/plugins/") { 8 * 1024 * 1024 } else { 8192 };
                 let _ = req.as_reader().take(lim).read_to_end(&mut body);
             }
 
@@ -65,7 +66,11 @@ pub fn spawn(state: Arc<Mutex<State>>, vit: Vitrinas, activa: Activa) {
                 Response::from_string(status_json(&state, &vit)).with_header(hdr("Content-Type", "application/json; charset=utf-8"))
             } else if let Some(rest) = path.strip_prefix("/vitrina/") {
                 let (id, sub) = rest.split_once('/').unwrap_or((rest, ""));
-                match vit.iter().find(|v| v.id() == id) {
+                let v = {
+                    let g = vit.lock().unwrap();
+                    g.iter().find(|x| x.id() == id).cloned()
+                };
+                match v {
                     None => Response::from_string("no existe").with_status_code(404),
                     Some(v) if is_post => {
                         let f = if ct.starts_with("application/x-www-form-urlencoded") {
@@ -90,6 +95,10 @@ pub fn spawn(state: Arc<Mutex<State>>, vit: Vitrinas, activa: Activa) {
                 let accion = path.strip_prefix("/invitados").unwrap_or("").trim_start_matches('/');
                 let msg = invitados::admin_post(accion, &form(&String::from_utf8_lossy(&body)));
                 page(&state, &vit, &msg, Some("invitados"))
+            } else if is_post && (path == "/plugins" || path.starts_with("/plugins/")) {
+                let accion = path.strip_prefix("/plugins").unwrap_or("").trim_start_matches('/');
+                let msg = plugin_admin_post(&state, &vit, &activa, accion, &query, &body);
+                page(&state, &vit, &msg, Some("plugins"))
             } else if is_post {
                 let msg = handle_post(&state, &vit, &path, &form(&String::from_utf8_lossy(&body)));
                 page(&state, &vit, &msg, None)
@@ -126,9 +135,10 @@ fn field<'a>(f: &'a [(String, String)], k: &str) -> &'a str {
 }
 
 fn handle_post(state: &Arc<Mutex<State>>, vit: &Vitrinas, path: &str, f: &[(String, String)]) -> String {
+    let ids: Vec<&str> = vit.lock().unwrap().iter().map(|v| v.id()).collect();
     match path {
         "/modo" if field(f, "modo").trim().is_empty() => "Elige una opción de la lista antes de guardar.".into(),
-        "/modo" => match Mode::parse(field(f, "modo"), vit) {
+        "/modo" => match Mode::parse(field(f, "modo"), &ids) {
             Some(m) => {
                 save_mode(m);
                 let mut s = state.lock().unwrap();
@@ -141,13 +151,19 @@ fn handle_post(state: &Arc<Mutex<State>>, vit: &Vitrinas, path: &str, f: &[(Stri
         },
         "/powerbank" => {
             let v = field(f, "valor");
-            let id = vit.iter().find(|x| x.id() == v).map(|x| x.id());
+            let id = ids.iter().find(|x| **x == v).copied();
             save_powerbank(id);
             let mut s = state.lock().unwrap();
             s.powerbank = id;
             s.request = Some(Request::ApplyMode);
             match id {
-                Some(i) => format!("En powerbank arrancará: {}.", html(vit.iter().find(|x| x.id() == i).map(|x| x.nombre()).unwrap_or(i))),
+                Some(i) => {
+                    let nombre = {
+                        let g = vit.lock().unwrap();
+                        g.iter().find(|x| x.id() == i).map(|x| x.nombre()).unwrap_or(i)
+                    };
+                    format!("En powerbank arrancará: {}.", html(nombre))
+                }
                 None => "En powerbank se queda en su modo normal.".into(),
             }
         }
@@ -157,7 +173,11 @@ fn handle_post(state: &Arc<Mutex<State>>, vit: &Vitrinas, path: &str, f: &[(Stri
             if ssid.is_empty() || ssid.len() > 32 {
                 return "El nombre de la red debe tener de 1 a 32 caracteres.".into();
             }
-            match vit.iter().find(|x| x.id() == id) {
+            let v = {
+                let g = vit.lock().unwrap();
+                g.iter().find(|x| x.id() == id).cloned()
+            };
+            match v {
                 Some(v) => {
                     save_ssid(v.id(), ssid);
                     let mut s = state.lock().unwrap();
@@ -211,9 +231,46 @@ fn handle_post(state: &Arc<Mutex<State>>, vit: &Vitrinas, path: &str, f: &[(Stri
     }
 }
 
+/// POST /plugins/subir|recargar|quitar.
+/// `subir` llega con el .so como cuerpo CRUDO y el `nombre` en la query (fetch desde el panel).
+fn plugin_admin_post(state: &Arc<Mutex<State>>, vit: &Vitrinas, activa: &Activa, accion: &str, query: &str, body: &[u8]) -> String {
+    match accion {
+        "subir" => {
+            let f = form(query);
+            let nombre = f.iter().find(|(k, _)| k == "nombre").map(|(_, v)| v.as_str()).unwrap_or("");
+            match crate::plugin::subir(vit, nombre, body) {
+                Ok(n) => {
+                    // si el modo guardado apunta a este plugin, se aplica en el loop
+                    state.lock().unwrap().request = Some(Request::ApplyMode);
+                    format!("Plugin «{n}» cargado: ya aparece en la lista de vitrinas.")
+                }
+                Err(e) => format!("No se pudo cargar el plugin: {e}"),
+            }
+        }
+        "recargar" => format!("{}.", crate::plugin::cargar_nuevos(vit)),
+        "quitar" => {
+            let f = form(&String::from_utf8_lossy(body));
+            let nombre = field(&f, "nombre");
+            let Some(id) = crate::plugin::id_de(vit, nombre) else {
+                return "No hay ningún plugin con ese archivo.".into();
+            };
+            // si era la vitrina al aire, la caemos antes de quitarla del vector
+            crate::stop_vitrina(vit, activa, &id);
+            match crate::plugin::quitar(vit, nombre) {
+                Ok(n) => format!("Plugin «{n}» quitado."),
+                Err(e) => format!("No se pudo quitar: {e}"),
+            }
+        }
+        _ => "Acción no válida.".into(),
+    }
+}
+
 fn mode_label(m: Mode, vit: &Vitrinas) -> String {
     match m {
-        Mode::Vitrina(id) => format!("Vitrina: {}", vit.iter().find(|v| v.id() == id).map(|v| v.nombre()).unwrap_or(id)),
+        Mode::Vitrina(id) => {
+            let g = vit.lock().unwrap();
+            format!("Vitrina: {}", g.iter().find(|v| v.id() == id).map(|v| v.nombre()).unwrap_or(id))
+        }
         Mode::Auto => "Conexión: automático".into(),
         Mode::Usb => "Conexión: solo USB".into(),
         Mode::Casa => "Conexión: solo WiFi".into(),
@@ -227,7 +284,8 @@ fn status_json(state: &Arc<Mutex<State>>, vit: &Vitrinas) -> String {
         (s.mode, s.effective, s.config_mode, s.internet, s.uplink.clone(), s.laptop.clone(), s.usb_sharing, s.host_present, s.powerbank)
     };
     let l = net::lte();
-    let vit_res: Vec<String> = vit.iter().map(|v| format!("{}:{}", json(v.id()), json(&v.resumen()))).collect();
+    let mods = vit.lock().unwrap().clone(); // se clonan los Arcs y se suelta el candado: resumen() puede tardar
+    let vit_res: Vec<String> = mods.iter().map(|v| format!("{}:{}", json(v.id()), json(&v.resumen()))).collect();
     format!(
         "{{\"modo\":{},\"efectivo\":{},\"configuracion\":{},\"internet\":{},\"salida\":{},\"pc_conectada\":{},\"powerbank\":{},\"laptop\":{},\"laptop_comparte\":{},\"wifi\":{},\"lte\":{{\"estado\":{},\"senal\":{},\"operador\":{},\"tecnologia\":{},\"sim\":{}}},\"wireguard\":{},\"ips\":{},\"vitrinas\":{{{}}}}}",
         json(&mode.key()),
@@ -273,6 +331,9 @@ pub(crate) fn page_html(state: &Arc<Mutex<State>>, vit: &Vitrinas, msg: &str, ab
         let s = state.lock().unwrap();
         (s.mode, s.config_mode, s.scan.clone(), s.powerbank)
     };
+    // se clonan los Arcs y se suelta el candado: resumen()/admin_html() pueden tardar (archivos, iw)
+    let mods = vit.lock().unwrap().clone();
+    let plugins: Vec<_> = mods.iter().filter(|v| v.es_plugin()).collect();
     let radio = |key: &str, label: &str, desc: &str| {
         let actual = mode.key() == key;
         format!(
@@ -292,7 +353,7 @@ pub(crate) fn page_html(state: &Arc<Mutex<State>>, vit: &Vitrinas, msg: &str, ab
     let mut r_vit = String::new();
     let mut pb_opts = format!("<option value=\"\" {}>Nada (quedarse en su modo)</option>", if pb.is_none() { "selected" } else { "" });
     let mut vit_cards = String::new();
-    for v in vit.iter() {
+    for v in &mods {
         r_vit += &radio(&format!("vitrina:{}", v.id()), v.nombre(), v.descripcion());
         pb_opts += &format!(
             "<option value=\"{}\" {}>{}</option>",
@@ -320,6 +381,32 @@ pub(crate) fn page_html(state: &Arc<Mutex<State>>, vit: &Vitrinas, msg: &str, ab
             admin = v.admin_html(),
         );
     }
+    let mut plugins_lista = String::new();
+    for p in &plugins {
+        plugins_lista += &format!(
+            "<li><span><b>{nombre}</b> <small class=mut>{archivo} · {desc}</small>{tag}</span><form method=post action=/plugins/quitar><input type=hidden name=nombre value=\"{archivo}\"><button class=link>Quitar</button></form></li>",
+            nombre = html(p.nombre()),
+            archivo = html(p.archivo().unwrap_or("")), 
+            desc = html(p.descripcion()),
+            tag = if matches!(mode, Mode::Vitrina(id) if id == p.id()) { " <span class=tag>al aire</span>" } else { "" },
+        );
+    }
+    let plugins_res = if plugins.is_empty() {
+        "ninguno instalado".to_string()
+    } else {
+        format!("{} instalado(s)", plugins.len())
+    };
+    let plugins_html = format!(
+        "<section class=\"card plegable\" id=plugins><details{open}><summary><span class=st><span class=h2>Plugins (nuevos módulos)</span><small class=mut>{res}</small></span><span class=abrir></span></summary><div class=cuerpo>
+<p class=mut style=\"margin-top:0\">Un plugin es un archivo .so con la ABI C de stickd (ABI v1, ver plugins/abi.h). Súbelo desde aquí o cópialo a la carpeta <b>/var/lib/stickd/plugins/</b> (también por scp) y pulsa «Recargar». El stick no se reinicia: el módulo queda disponible de inmediato en la lista de vitrinas y se puede quitar cuando se quiera.</p>
+{lista}
+<div class=row style=margin-bottom:12px><label style=flex:1>Plugin (.so)<input type=file id=pl-file accept=\".so\"></label><button onclick=subir_plugin()>Subir</button></div>
+<form method=post action=/plugins/recargar><button>Recargar carpeta</button></form>
+</div></details></section>",
+        open = if abrir == Some("plugins") { " open" } else { "" },
+        res = html(&plugins_res),
+        lista = if plugins_lista.is_empty() { "<p class=mut>Aún no hay plugins.</p>".to_string() } else { plugins_lista },
+    );
     let lado = if matches!(mode, Mode::Vitrina(_)) { "vit" } else { "con" };
     let saved: String = saved
         .iter()
@@ -384,8 +471,9 @@ fieldset>p{{margin:0 0 8px;font-size:14px}}
 <section class=card><h2>Al conectarlo a una powerbank</h2>
 <p class=mut style="margin-top:0">Si no hay una computadora en el USB por 10 s, el stick arranca esta vitrina sola. Al volver a conectarlo a la PC regresa a su modo.</p>
 <form method=post action=/powerbank class=row><select name=valor style=flex:1>{pb_opts}</select><button>Guardar</button></form></section>
-<section class="card plegable" id=invitados><details{inv_open}><summary><span class=st><span class=h2>Internet para invitados</span><small class=mut>{inv_res}</small></span><span class=abrir></span></summary><div class=cuerpo>{inv_html}</div></details></section>
-<h2 style="margin:22px 0 4px">Vitrinas</h2>
+ <section class="card plegable" id=invitados><details{inv_open}><summary><span class=st><span class=h2>Internet para invitados</span><small class=mut>{inv_res}</small></span><span class=abrir></span></summary><div class=cuerpo>{inv_html}</div></details></section>
+  {plugins_html}
+  <h2 style="margin:22px 0 4px">Vitrinas</h2>
 <p class=mut style="margin:0 0 10px">Toca una para configurarla. Para ponerla al aire elígela arriba, en «Modo de trabajo» → «Vitrina».</p>
 {vit_cards}
 <section class=card><h2>Redes WiFi para tener internet</h2><ul>{saved}</ul>
@@ -416,6 +504,9 @@ row('Cable USB',s.pc_conectada?(s.laptop?'PC '+e(s.laptop)+(s.laptop_comparte?' 
 row('WiFi',e(s.wifi||'—'))+
 row('LTE (SIM)',s.lte.sim?e(s.lte.estado)+' · señal '+e(s.lte.senal)+'% '+e(s.lte.tecnologia)+' '+e(s.lte.operador):'sin SIM')+
 row('Túnel WireGuard',e(s.wireguard))+row('Direcciones IP','<pre>'+e(s.ips)+'</pre>');}}catch(_){{}}}}
+function subir_plugin(){{var f=document.getElementById('pl-file');if(!f||!f.files[0]){{alert('Elige un archivo .so primero');return}}
+fetch('/plugins/subir?nombre='+encodeURIComponent(f.files[0].name),{{method:'POST',body:f.files[0],headers:{{'Content-Type':'application/octet-stream'}}}})
+.then(function(r){{return r.text()}}).then(function(t){{alert(t);location.reload()}}).catch(function(){{alert('No se pudo subir el archivo')}})}}
 f();setInterval(f,5000);
 </script></body></html>"#,
         inv_open = if abrir == Some("invitados") { " open" } else { "" },
@@ -461,7 +552,7 @@ mod tests {
     fn panel_switch_de_modo() {
         let d = std::env::temp_dir().join(format!("panel-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
-        let vit: Vitrinas = Arc::new(vec![Box::new(Portafolio::with_dir(d.clone()))]);
+        let vit: Vitrinas = Arc::new(Mutex::new(vec![Arc::new(Portafolio::with_dir(d.clone()))]));
         let h = cuerpo(page(&estado(Mode::Vitrina("portafolio")), &vit, "", None));
         assert!(h.contains("id=modo data-lado=vit"));
         assert!(h.contains("value=\"vitrina:portafolio\" checked"));
@@ -498,12 +589,12 @@ mod tests {
         if std::env::var("PANEL_DESCARGA").is_ok() {
             p.simular_descarga("otra", "Descargando archivo 4 de 9 · 3 archivos listos · 152 KB bajados");
         }
-        let vit: Vitrinas = Arc::new(vec![
-            Box::new(p),
-            Box::new(vitrina::tarjeta::Tarjeta::new()),
-            Box::new(vitrina::buzon::Buzon::new()),
-            Box::new(vitrina::afluencia::Afluencia::new()),
-        ]);
+        let vit: Vitrinas = Arc::new(Mutex::new(vec![
+            Arc::new(p),
+            Arc::new(vitrina::tarjeta::Tarjeta::new()),
+            Arc::new(vitrina::buzon::Buzon::new()),
+            Arc::new(vitrina::afluencia::Afluencia::new()),
+        ]));
         let msg = if std::env::var("PANEL_DESCARGA").is_ok() { "Descarga iniciada." } else { "" };
         let h = cuerpo(page(&estado(Mode::Vitrina("portafolio")), &vit, msg, Some("portafolio")));
         std::fs::write(out.join("panel.html"), h).unwrap();

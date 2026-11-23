@@ -16,6 +16,7 @@
 
 use std::net::IpAddr;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 pub mod afluencia;
 pub mod buzon;
@@ -76,6 +77,14 @@ pub trait Vitrina: Send + Sync {
     fn usa_ap(&self) -> bool {
         true
     }
+    /// ¿Este módulo es un plugin externo (.so)? Los internos (src/vitrina) dejan el default.
+    fn es_plugin(&self) -> bool {
+        false
+    }
+    /// Nombre del archivo .so (solo plugins externos; los internos devuelven None).
+    fn archivo(&self) -> Option<&str> {
+        None
+    }
     /// Tamaño máximo de cuerpo aceptado en peticiones de invitados
     fn max_body(&self) -> usize {
         16 * 1024
@@ -114,14 +123,15 @@ pub fn data_dir(id: &str) -> PathBuf {
     p
 }
 
-/// Todos los módulos registrados, en el orden en que aparecen en el panel.
-pub fn todas() -> Vec<Box<dyn Vitrina>> {
+/// Todos los módulos INTERNIOS (src/vitrina), en el orden en que aparecen en el panel.
+/// Los plugins externos (src/plugin.rs, carpeta /var/lib/stickd/plugins) se agregan encima.
+pub fn todas() -> Vec<Arc<dyn Vitrina>> {
     vec![
-        Box::new(portafolio::Portafolio::new()),
-        Box::new(tarjeta::Tarjeta::new()),
-        Box::new(buzon::Buzon::new()),
-        Box::new(chat::Chat::new()),
-        Box::new(compartir::Compartir::new()),
-        Box::new(afluencia::Afluencia::new()),
+        Arc::new(portafolio::Portafolio::new()),
+        Arc::new(tarjeta::Tarjeta::new()),
+        Arc::new(buzon::Buzon::new()),
+        Arc::new(chat::Chat::new()),
+        Arc::new(compartir::Compartir::new()),
+        Arc::new(afluencia::Afluencia::new()),
     ]
 }

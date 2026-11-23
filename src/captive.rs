@@ -9,7 +9,7 @@
 
 use crate::invitados;
 use crate::util::{log, run};
-use crate::vitrina::{GuestReq, GuestResp, Vitrina};
+use crate::vitrina::{GuestReq, GuestResp};
 use std::io::Read;
 use std::net::{IpAddr, UdpSocket};
 use std::sync::{Arc, Mutex};
@@ -20,8 +20,9 @@ const GUEST_PORT: u16 = 8080;
 // 5300 y no 5353: 5353 es mDNS, que los celulares usan entre ellos (WebRTC de "Compartir archivos")
 const DNS_PORT: u16 = 5300;
 
-/// Índice del módulo activo en el vector de vitrinas (None = ninguna vitrina con AP activa).
-pub type Activa = Arc<Mutex<Option<usize>>>;
+/// Id del módulo activo (None = ninguna vitrina con AP activa). Id y no índice: el vector
+/// de módulos crece cuando se cargan plugins y los índices se moverían.
+pub type Activa = Arc<Mutex<Option<String>>>;
 
 /// Reglas del portal. `ap` = interfaces del AP; `elementos` = invitados con internet (ip, s).
 pub fn nft_reglas(ap: &[String], cfg: &invitados::Config, elementos: &[(std::net::Ipv4Addr, u64)]) -> String {
@@ -106,7 +107,7 @@ pub fn firewall_off() {
     let _ = run("nft", &["delete", "table", "inet", "stickd_captive"]);
 }
 
-pub fn spawn(vitrinas: Arc<Vec<Box<dyn Vitrina>>>, activa: Activa) {
+pub fn spawn(vitrinas: crate::Vitrinas, activa: Activa) {
     std::thread::spawn(dns_server);
     std::thread::spawn(move || guest_server(vitrinas, activa));
 }
@@ -187,7 +188,7 @@ pub fn is_probe(host: &str, path: &str) -> bool {
         || h == "nmcheck.gnome.org"
 }
 
-fn guest_server(vitrinas: Arc<Vec<Box<dyn Vitrina>>>, activa: Activa) {
+fn guest_server(vitrinas: crate::Vitrinas, activa: Activa) {
     let server = match Server::http(("0.0.0.0", GUEST_PORT)) {
         Ok(s) => s,
         Err(e) => {
@@ -204,12 +205,22 @@ fn guest_server(vitrinas: Arc<Vec<Box<dyn Vitrina>>>, activa: Activa) {
             }
             _ => false,
         };
-        let idx = *activa.lock().unwrap();
-        let (Some(idx), true) = (idx, permitido) else {
+        let id = {
+            let g = activa.lock().unwrap();
+            g.clone()
+        };
+        let (Some(id), true) = (id, permitido) else {
             let _ = req.respond(Response::from_string("no hay vitrina activa").with_status_code(503));
             continue;
         };
-        let v = &vitrinas[idx];
+        let v = {
+            let g = vitrinas.lock().unwrap();
+            g.iter().find(|x| x.id() == id).cloned()
+        };
+        let Some(v) = v else {
+            let _ = req.respond(Response::from_string("no hay vitrina activa").with_status_code(503));
+            continue;
+        };
         let hdr = |name: &'static str| {
             req.headers().iter().find(|h| h.field.equiv(name)).map(|h| h.value.as_str().to_string()).unwrap_or_default()
         };
@@ -297,24 +308,33 @@ pub fn to_tiny(r: GuestResp) -> Response<std::io::Cursor<Vec<u8>>> {
 
 /// Crea o actualiza la conexión NM "vitrina" (abierta) con el SSID dado y la levanta.
 pub fn ap_up(ssid: &str) -> bool {
-    let exists = run("nmcli", &["-t", "-f", "NAME", "con", "show"]).1.lines().any(|l| l == "vitrina");
-    if !exists {
-        let ok = run(
-            "nmcli",
-            &[
-                "con", "add", "type", "wifi", "ifname", "wlan0", "con-name", "vitrina", "ssid", ssid, "802-11-wireless.mode", "ap", "802-11-wireless.ap-isolation", "false",
-                "802-11-wireless.band", "bg", "ipv4.method", "shared", "ipv4.addresses", "192.168.4.1/24", "ipv6.method", "ignore",
-                "connection.autoconnect", "no", "connection.autoconnect-priority", "-10",
-            ],
-        )
-        .0;
+    let crear: Vec<&str> = vec![
+        "con", "add", "type", "wifi", "ifname", "wlan0", "con-name", "vitrina", "ssid", ssid, "802-11-wireless.mode", "ap", "802-11-wireless.ap-isolation", "false",
+        "802-11-wireless.band", "bg", "ipv4.method", "shared", "ipv4.addresses", "192.168.4.1/24", "ipv6.method", "ignore",
+        "connection.autoconnect", "no", "connection.autoconnect-priority", "-10",
+    ];
+    let modificar: Vec<String> = vec![
+        "con".into(),
+        "modify".into(),
+        "vitrina".into(),
+        format!("802-11-wireless.ssid={ssid}"),
+        "802-11-wireless.ap-isolation=false".into(),
+    ];
+    let existe = run("nmcli", &["-t", "-f", "NAME", "con", "show"]).1.lines().any(|l| l == "vitrina");
+    if !existe {
+        let ok = run("nmcli", &crear).0;
         if !ok {
             log("captive: no pude crear la conexión vitrina");
             return false;
         }
     } else {
-        // sin aislamiento entre clientes: "Compartir archivos" va celular↔celular por el AP
-        let _ = run("nmcli", &["con", "modify", "vitrina", "802-11-wireless.ssid", ssid, "802-11-wireless.ap-isolation", "false"]);
+        // sin aislamiento entre clientes: "Compartir archivos" va celular↔celular por el AP;
+        // down+up para que cambie de verdad el SSID
+        let args: Vec<&str> = modificar.iter().map(|s| s.as_str()).collect();
+        if !run("nmcli", &args).0 {
+            log("captive: no pude modificar la conexión vitrina");
+        }
+        let _ = run("nmcli", &["con", "down", "vitrina"]);
     }
     run("nmcli", &["--wait", "30", "con", "up", "vitrina"]).0
 }
@@ -366,6 +386,8 @@ mod tests {
         let r = nft_reglas(&ap, &c, &[("192.168.4.9".parse().unwrap(), 120)]);
         assert!(!r.contains("@lim_baja {"), "sin límite de bajada no hay policía");
         assert!(r.contains("elements = { 192.168.4.9 timeout 120s };"));
+        assert!(!r.contains("dport 123"), "no hay regla NTP");
+        assert!(r.contains("udp dport { 67, 5300 } accept"));
         let r = nft_reglas(&["wlan0".into(), "stkp0".into()], &c, &[]);
         assert!(r.contains("iifname { \"wlan0\", \"stkp0\" } drop"));
     }

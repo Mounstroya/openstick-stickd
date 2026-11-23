@@ -18,9 +18,13 @@ The hardware is very limited, and that decided the language:
 | Base system | Debian 13, with **no Python, no curl, no busybox** out of the box |
 
 A Python or Node implementation would need 20–50 MB of RAM and a runtime installed on the
-device. `stickd` is **one statically linked binary (~1 MB, musl)** that uses **under 1 MB of
-RAM** at runtime. It is cross-compiled on a laptop and copied over, so nothing has to be
-installed on the stick. The only dependencies are `tiny_http`, `qrcode` and `libc`.
+device. `stickd` is **one ~1 MB native binary** with a tiny runtime footprint. It is
+cross-compiled on a laptop and copied over, so nothing has to be installed on the stick. The
+only Rust dependencies are `tiny_http`, `qrcode` and `libc`.
+
+It is built for `aarch64-unknown-linux-gnu` (dynamically linked against the stick's glibc,
+which Debian already ships). An earlier version targeted static musl, but that was changed:
+a fully static musl binary **cannot `dlopen`**, which the [plugin system](#plugins) needs.
 
 ## What it does
 
@@ -91,15 +95,16 @@ only for tests) and takes the screenshots with headless Chromium.
 ## Building
 
 ```sh
-rustup target add aarch64-unknown-linux-musl
-cargo build --release --target aarch64-unknown-linux-musl   # linker: rust-lld (see .cargo/config.toml)
+rustup target add aarch64-unknown-linux-gnu
+sudo apt install gcc-aarch64-linux-gnu                       # linker (see .cargo/config.toml)
+cargo build --release --target aarch64-unknown-linux-gnu
 cargo test
 ```
 
 ## Installing on the stick
 
 ```sh
-scp target/aarch64-unknown-linux-musl/release/stickd user@192.168.5.1:/tmp/
+scp target/aarch64-unknown-linux-gnu/release/stickd user@192.168.5.1:/tmp/
 ssh user@192.168.5.1 'sudo install -m755 /tmp/stickd /usr/local/sbin/stickd'
 ```
 
@@ -109,6 +114,29 @@ at **http://192.168.5.1** over USB, or at http://192.168.4.1 from the setup hots
 
 `laptop/` contains a NetworkManager dispatcher script that shares the laptop's internet with
 the stick automatically when it is plugged in.
+
+## Plugins
+
+New modules can be added as **shared objects (`.so`) with a C ABI** — dropped in at runtime,
+no rebuild and no restart. Write them in any language that compiles to a shared object (C, Go,
+Zig, Rust `cdylib`, …). A plugin shows up as another showcase in the panel; when it's on air
+it gets each guest request and its own admin section.
+
+`stickd_init()` hands the plugin a **host API** table so it never has to touch the system
+directly: logging, uplink status, Wi-Fi scan, HTTP GET, send/list SMS, LEDs, and the list of
+connected guests. The full contract is in [`plugins/abi.h`](plugins/abi.h); a how-to is in
+[`plugins/README.md`](plugins/README.md); and [`plugin-ejemplo/hola.c`](plugin-ejemplo/hola.c)
+is a complete minimal example.
+
+Compile for the stick (aarch64, glibc) and install from the panel:
+
+```sh
+aarch64-linux-gnu-gcc -shared -fPIC -O2 -o mi.so mi.c   # or gcc on the stick itself
+# Panel → Plugins → Subir (upload the .so), or scp to /var/lib/stickd/plugins/ and "Recargar"
+```
+
+> **A plugin runs as root, in-process, with no sandbox.** Installing someone's `.so` means
+> trusting them completely. Only load plugins whose source you've read or that you built.
 
 ## Security notes
 

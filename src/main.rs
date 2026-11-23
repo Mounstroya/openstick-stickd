@@ -24,6 +24,7 @@ mod captive;
 mod invitados;
 mod leds;
 mod net;
+mod plugin;
 mod portal;
 mod util;
 mod vitrina;
@@ -42,7 +43,10 @@ const CONFIG_COOLDOWN: Duration = Duration::from_secs(300);
 const NO_HOST_TO_POWERBANK: Duration = Duration::from_secs(10);
 const TICK: Duration = Duration::from_secs(5);
 
-pub type Vitrinas = Arc<Vec<Box<dyn Vitrina>>>;
+/// Módulos de vitrina, internos (src/vitrina) y plugins cargados a vuelo (src/plugin.rs).
+/// Se bloquea solo para mirar/insertar/quitar; las llamadas a los módulos van sobre el
+/// `Arc` clonado, sin el candado puesto.
+pub type Vitrinas = Arc<Mutex<Vec<Arc<dyn Vitrina>>>>;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Mode {
@@ -55,7 +59,7 @@ pub enum Mode {
 }
 
 impl Mode {
-    pub fn parse(s: &str, vit: &[Box<dyn Vitrina>]) -> Option<Mode> {
+    pub fn parse(s: &str, ids: &[&str]) -> Option<Mode> {
         match s.trim() {
             "auto" => Some(Mode::Auto),
             "usb" => Some(Mode::Usb),
@@ -63,7 +67,12 @@ impl Mode {
             "lte" => Some(Mode::Lte),
             v => {
                 let id = v.strip_prefix("vitrina:")?;
-                vit.iter().find(|x| x.id() == id).map(|x| Mode::Vitrina(x.id()))
+                if ids.iter().any(|x| *x == id) {
+                    // el id vive en la lista de módulos; Mode es Copy, así que se escapa
+                    Some(Mode::Vitrina(Box::leak(id.to_string().into_boxed_str())))
+                } else {
+                    None
+                }
             }
         }
     }
@@ -167,12 +176,13 @@ fn apply_uplinks(m: Mode, config_mode: bool) {
     }
 }
 
-fn vit_by_id<'a>(vit: &'a Vitrinas, id: &str) -> Option<(usize, &'a dyn Vitrina)> {
-    vit.iter().enumerate().find(|(_, v)| v.id() == id).map(|(i, v)| (i, v.as_ref()))
+/// Devuelve una copia del `Arc` del módulo (el candado se suelta antes de llamarlo).
+fn vit_by_id(vit: &Vitrinas, id: &str) -> Option<Arc<dyn Vitrina>> {
+    vit.lock().unwrap().iter().find(|v| v.id() == id).cloned()
 }
 
-fn stop_vitrina(vit: &Vitrinas, activa: &captive::Activa, id: &str) {
-    if let Some((_, v)) = vit_by_id(vit, id) {
+pub(crate) fn stop_vitrina(vit: &Vitrinas, activa: &captive::Activa, id: &str) {
+    if let Some(v) = vit_by_id(vit, id) {
         log(&format!("deteniendo vitrina {id}"));
         *activa.lock().unwrap() = None;
         v.stop();
@@ -184,20 +194,19 @@ fn stop_vitrina(vit: &Vitrinas, activa: &captive::Activa, id: &str) {
 }
 
 fn start_vitrina(vit: &Vitrinas, activa: &captive::Activa, id: &str) {
-    if let Some((i, v)) = vit_by_id(vit, id) {
-        log(&format!("iniciando vitrina {id}"));
-        if v.usa_ap() {
-            net::wifis_down();
-            let ssid = ssid_for(v);
-            if captive::ap_up(&ssid) && captive::firewall_on() {
-                *activa.lock().unwrap() = Some(i);
-                log(&format!("vitrina {id} al aire con SSID «{ssid}»"));
-            } else {
-                log(&format!("no se pudo levantar el AP de la vitrina {id}"));
-            }
+    let Some(v) = vit_by_id(vit, id) else { return };
+    log(&format!("iniciando vitrina {id}"));
+    if v.usa_ap() {
+        net::wifis_down();
+        let ssid = ssid_for(v.as_ref());
+        if captive::ap_up(&ssid) && captive::firewall_on() {
+            *activa.lock().unwrap() = Some(id.to_string());
+            log(&format!("vitrina {id} al aire con SSID «{ssid}»"));
+        } else {
+            log(&format!("no se pudo levantar el AP de la vitrina {id}"));
         }
-        v.start();
     }
+    v.start();
 }
 
 fn enter_config(state: &Arc<Mutex<State>>, vit: &Vitrinas, activa: &captive::Activa) {
@@ -257,11 +266,16 @@ fn main() {
     log(&format!("iniciando stickd {}", env!("CARGO_PKG_VERSION")));
     one_time_setup();
 
-    let vit: Vitrinas = Arc::new(vitrina::todas());
+    let vit: Vitrinas = Arc::new(Mutex::new(vitrina::todas()));
+    plugin::cargar_todas(&vit);
     let activa: captive::Activa = Arc::new(Mutex::new(None));
-    let mode = Mode::parse(&read_trim(MODE_FILE), &vit).unwrap_or(Mode::Auto);
+    let ids: Vec<&str> = vit.lock().unwrap().iter().map(|v| v.id()).collect();
+    let mode = Mode::parse(&read_trim(MODE_FILE), &ids).unwrap_or(Mode::Auto);
     let pb = read_trim(POWERBANK_FILE);
-    let powerbank = vit.iter().find(|v| v.id() == pb).map(|v| v.id());
+    let powerbank = {
+        let g = vit.lock().unwrap();
+        g.iter().find(|v| v.id() == pb).map(|v| v.id())
+    };
 
     let state = Arc::new(Mutex::new(State {
         mode,
@@ -343,7 +357,7 @@ fn main() {
             applied = None;
         } else if let Mode::Vitrina(id) = eff {
             // el AP no levantó (radio ocupado, NM lento…): reintentar cada 30 s
-            let needs_ap = vit_by_id(&vit, id).is_some_and(|(_, v)| v.usa_ap());
+            let needs_ap = vit_by_id(&vit, id).is_some_and(|v| v.usa_ap());
             if needs_ap && !cfg && activa.lock().unwrap().is_none() && last_ap_try.elapsed() > Duration::from_secs(30) {
                 last_ap_try = Instant::now();
                 log(&format!("reintentando el AP de la vitrina {id}"));
