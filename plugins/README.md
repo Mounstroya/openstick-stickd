@@ -61,6 +61,10 @@ aarch64-linux-gnu-gcc -shared -fPIC -O2 -o mi.so mi.c
 gcc -shared -fPIC -O2 -o mi.so mi.c
 ```
 
+**Without any toolchain**, let GitHub Actions compile it: put your `.c` in
+[`../plugins-comunidad/`](../plugins-comunidad/), push (or open a PR), and download the
+compiled `.so` from the Actions run. See that folder's README.
+
 ## Installing / removing
 
 - **Panel:** `Plugins → Subir` (pick the `.so`). It loads in place, no restart.

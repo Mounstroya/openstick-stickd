@@ -76,7 +76,7 @@ stickd_respuesta *stickd_guest(uintptr_t handle, const char *method, const char 
     if (strcmp(path, "/") != 0) {
         r->estado = 404;
         r->cabeceras = strdup("Content-Type: text/plain; charset=utf-8");
-        r->cuerpo = strdup("no encontrado");
+        r->cuerpo = (const uint8_t *)strdup("no encontrado");
         r->cuerpo_len = strlen((const char *)r->cuerpo);
         return r;
     }
@@ -84,7 +84,7 @@ stickd_respuesta *stickd_guest(uintptr_t handle, const char *method, const char 
     long n = visitas_leer() + 1;
     visitas_escribir(n);
 
-    char buf[320];
+    char buf[640];
     snprintf(buf, sizeof buf,
              "<!doctype html><html lang=es><meta charset=utf-8><meta name=viewport content=\"width=device-width,initial-scale=1\">"
              "<body style=\"font-family:system-ui;margin:40px\"><h1>Hola</h1>"
@@ -95,7 +95,7 @@ stickd_respuesta *stickd_guest(uintptr_t handle, const char *method, const char 
 
     r->estado = 200;
     r->cabeceras = strdup("Content-Type: text/html; charset=utf-8");
-    r->cuerpo = strdup(buf);
+    r->cuerpo = (const uint8_t *)strdup(buf);
     r->cuerpo_len = strlen(buf);
     return r;
 }

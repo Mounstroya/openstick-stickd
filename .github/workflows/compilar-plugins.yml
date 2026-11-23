@@ -1,0 +1,74 @@
+name: Compilar plugins
+
+# Compila los plugins .c a .so de aarch64 (el stick es Debian/glibc, ARM64) y los
+# deja descargables como "artifacts" del run. Así cualquiera puede escribir un
+# plugin en C, subir su .c (en plugins-comunidad/) y bajar el .so ya compilado,
+# sin instalar nada en su PC.
+#
+# Cómo usarlo:
+#   1. Haz un fork de este repo.
+#   2. Pon tu archivo .c en plugins-comunidad/ (incluye "abi.h": #include "abi.h").
+#   3. Haz commit/push, o abre un Pull Request. Este flujo se ejecuta solo.
+#   4. En la pestaña "Actions", abre el run y descarga el artifact "plugins-so".
+#      Ese .so se sube al stick desde el panel (Plugins → Subir).
+#
+# También se puede lanzar a mano desde la pestaña Actions (workflow_dispatch).
+
+on:
+  push:
+    paths:
+      - 'plugins-comunidad/**.c'
+      - 'plugin-ejemplo/**.c'
+      - 'plugins/abi.h'
+      - '.github/workflows/compilar-plugins.yml'
+  pull_request:
+    paths:
+      - 'plugins-comunidad/**.c'
+      - 'plugin-ejemplo/**.c'
+      - 'plugins/abi.h'
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  compilar:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Instalar el compilador cruzado aarch64
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+
+      - name: Compilar cada .c a .so (aarch64)
+        run: |
+          set -e
+          mkdir -p salida
+          encontrados=0
+          for c in plugin-ejemplo/*.c plugins-comunidad/*.c; do
+            [ -e "$c" ] || continue
+            encontrados=$((encontrados+1))
+            nombre="$(basename "${c%.c}")"
+            echo "::group::$c -> $nombre.so"
+            # -Iplugins para "#include \"abi.h\""; el include relativo del ejemplo también funciona
+            aarch64-linux-gnu-gcc -shared -fPIC -O2 -Wall -Iplugins \
+              -o "salida/$nombre.so" "$c"
+            file "salida/$nombre.so"
+            echo "::endgroup::"
+          done
+          if [ "$encontrados" -eq 0 ]; then
+            echo "No hay .c que compilar."; exit 0
+          fi
+          # verificación: deben ser ELF aarch64
+          for so in salida/*.so; do
+            file "$so" | grep -q "ARM aarch64" || { echo "ERROR: $so no es aarch64"; exit 1; }
+          done
+
+      - name: Publicar los .so como artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: plugins-so
+          path: salida/*.so
+          if-no-files-found: ignore
