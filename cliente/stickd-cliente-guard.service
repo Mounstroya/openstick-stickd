@@ -1,0 +1,12 @@
+[Unit]
+Description=Candado del modo cliente (nftables)
+After=network-pre.target
+Before=stickd-proxy.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/sbin/nft -f /etc/stickd/cliente-guard.nft
+
+[Install]
+WantedBy=multi-user.target

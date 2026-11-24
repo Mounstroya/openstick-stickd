@@ -1,0 +1,37 @@
+# Candado del modo cliente. Lo instala cliente/instalar.sh, que sustituye @HUB@ y @PUERTO@.
+#  - Por el túnel solo entra el hub: SSH, el proxy y ping.
+#  - Desde el WiFi del cliente no se puede entrar al stick (ni panel ni SSH). 192.168.4.1 solo
+#    existe cuando el propio stick abre su red (botón de configuración o una vitrina).
+#  - El usuario del proxy no puede hablar con redes privadas.
+#  - El túnel no se usa para cruzar hacia la red del cliente.
+table inet stickd_cliente
+delete table inet stickd_cliente
+table inet stickd_cliente {
+  set privadas4 {
+    type ipv4_addr; flags interval
+    elements = { 0.0.0.0/8, 10.0.0.0/8, 100.64.0.0/10, 127.0.0.0/8, 169.254.0.0/16, 172.16.0.0/12, 192.168.0.0/16, 198.18.0.0/15, 224.0.0.0/3 }
+  }
+  chain input {
+    type filter hook input priority 0; policy accept;
+    ct state established,related accept
+    iifname "wg0" ip saddr @HUB@ tcp dport { 22, @PUERTO@ } accept
+    iifname "wg0" ip saddr @HUB@ icmp type echo-request accept
+    iifname "wg0" drop
+    tcp dport @PUERTO@ drop
+    iifname "wlan0" ip daddr 192.168.4.1 accept
+    iifname "wlan0" udp dport { 67, 68, 546 } accept
+    iifname "wlan0" icmpv6 type { nd-router-advert, nd-neighbor-solicit, nd-neighbor-advert, mld-listener-query } accept
+    iifname "wlan0" drop
+  }
+  chain forward {
+    type filter hook forward priority 0; policy accept;
+    iifname "wg0" drop
+    oifname "wg0" drop
+  }
+  chain output {
+    type filter hook output priority 0; policy accept;
+    oifname "wg0" meta skuid "stickproxy" ct state established accept
+    meta skuid "stickproxy" ip daddr @privadas4 drop
+    meta skuid "stickproxy" ip6 daddr { ::1, ::ffff:0:0/96, 64:ff9b::/96, 2002::/16, fc00::/7, fe80::/10, ff00::/8 } drop
+  }
+}

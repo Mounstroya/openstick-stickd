@@ -26,6 +26,7 @@ mod leds;
 mod net;
 mod plugin;
 mod portal;
+mod proxy;
 mod util;
 mod vitrina;
 
@@ -54,6 +55,9 @@ pub enum Mode {
     Usb,
     Casa,
     Lte,
+    /// Stick en casa de un cliente: solo da salida por su WiFi (o USB). Sin SIM, sin vitrinas y sin
+    /// abrir el hotspot de configuración por su cuenta (solo con el botón). Ver cliente/README.md.
+    Cliente,
     /// id del módulo de vitrina
     Vitrina(&'static str),
 }
@@ -65,6 +69,7 @@ impl Mode {
             "usb" => Some(Mode::Usb),
             "casa" => Some(Mode::Casa),
             "lte" => Some(Mode::Lte),
+            "cliente" => Some(Mode::Cliente),
             v => {
                 let id = v.strip_prefix("vitrina:")?;
                 if ids.iter().any(|x| *x == id) {
@@ -82,6 +87,7 @@ impl Mode {
             Mode::Usb => "usb".into(),
             Mode::Casa => "casa".into(),
             Mode::Lte => "lte".into(),
+            Mode::Cliente => "cliente".into(),
             Mode::Vitrina(id) => format!("vitrina:{id}"),
         }
     }
@@ -89,7 +95,7 @@ impl Mode {
         !matches!(self, Mode::Casa | Mode::Lte)
     }
     fn allows_wifi(self) -> bool {
-        matches!(self, Mode::Auto | Mode::Casa)
+        matches!(self, Mode::Auto | Mode::Casa | Mode::Cliente)
     }
     fn allows_lte(self) -> bool {
         matches!(self, Mode::Auto | Mode::Lte | Mode::Vitrina(_))
@@ -263,6 +269,10 @@ fn main() {
         println!("stickd {}", env!("CARGO_PKG_VERSION"));
         return;
     }
+    if std::env::args().nth(1).as_deref() == Some("proxy") {
+        let archivo = std::env::args().nth(2).unwrap_or_else(|| "/etc/stickd/proxy.conf".into());
+        std::process::exit(proxy::main(&archivo));
+    }
     log(&format!("iniciando stickd {}", env!("CARGO_PKG_VERSION")));
     one_time_setup();
 
@@ -323,7 +333,7 @@ fn main() {
             (s.mode, s.request.take(), s.config_mode, s.powerbank)
         };
         let eff = match (on_powerbank, pb) {
-            (true, Some(id)) if !matches!(mode, Mode::Vitrina(_)) => Mode::Vitrina(id),
+            (true, Some(id)) if !matches!(mode, Mode::Vitrina(_) | Mode::Cliente) => Mode::Vitrina(id),
             _ => mode,
         };
 
@@ -390,7 +400,8 @@ fn main() {
         invitados::set_salida(internet && !uplink.is_empty() && uplink != "wlan0" && uplink != "wg0", &uplink);
 
         // 4. Configuración automática si no hay internet (no en vitrina: ahí es normal)
-        if internet || matches!(eff, Mode::Vitrina(_)) {
+        // ni en cliente: no se abre una red en casa ajena cada vez que falla su internet
+        if internet || matches!(eff, Mode::Vitrina(_) | Mode::Cliente) {
             no_net_since = None;
         } else {
             let since = *no_net_since.get_or_insert_with(Instant::now);

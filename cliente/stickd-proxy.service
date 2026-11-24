@@ -1,0 +1,32 @@
+[Unit]
+Description=Proxy HTTPS del modo cliente, solo por el tunel
+# sin candado no hay proxy; sin tunel, tampoco
+Requires=stickd-cliente-guard.service
+BindsTo=wg-quick@wg0.service
+After=stickd-cliente-guard.service wg-quick@wg0.service
+StartLimitIntervalSec=0
+
+[Service]
+User=stickproxy
+LoadCredential=proxy.conf:/etc/stickd/proxy.conf
+ExecStart=/usr/local/sbin/stickd proxy %d/proxy.conf
+Restart=always
+RestartSec=5
+MemoryMax=48M
+TasksMax=160
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+
+[Install]
+WantedBy=wg-quick@wg0.service

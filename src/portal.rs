@@ -275,6 +275,7 @@ fn mode_label(m: Mode, vit: &Vitrinas) -> String {
         Mode::Usb => "Conexión: solo USB".into(),
         Mode::Casa => "Conexión: solo WiFi".into(),
         Mode::Lte => "Conexión: solo LTE".into(),
+        Mode::Cliente => "Conexión: cliente (proxy)".into(),
     }
 }
 
@@ -349,6 +350,7 @@ pub(crate) fn page_html(state: &Arc<Mutex<State>>, vit: &Vitrinas, msg: &str, ab
     r_con += &radio("auto", "Automático (recomendado)", "Usa lo que haya, en este orden: cable USB, WiFi guardado, LTE de la SIM.");
     r_con += &radio("usb", "Solo USB", "Solo el internet que comparte la laptop por el cable.");
     r_con += &radio("casa", "Solo WiFi", "Se conecta a tus redes WiFi guardadas. La SIM no se usa.");
+    r_con += &radio("cliente", "Cliente (proxy)", "Para dejarlo fijo en casa de un cliente: WiFi guardado, sin SIM ni vitrinas. La red de configuración solo se abre con el botón.");
     r_con += &radio("lte", "Solo LTE", "Usa los datos de la SIM. El WiFi no se usa.");
     let mut r_vit = String::new();
     let mut pb_opts = format!("<option value=\"\" {}>Nada (quedarse en su modo)</option>", if pb.is_none() { "selected" } else { "" });

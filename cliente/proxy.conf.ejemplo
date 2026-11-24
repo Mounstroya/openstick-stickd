@@ -1,0 +1,9 @@
+# Ejemplo de /etc/stickd/proxy.conf (lo escribe cliente/instalar.sh; modo 600, nunca al repo).
+# IP del stick dentro del túnel:
+escucha = 10.9.0.2:8888
+# usuario:contraseña (16 caracteres o más). Un stick, un cliente, una contraseña.
+usuario = cliente-demo:cambia-esta-clave-larga
+# ".dominio.com" = el dominio y sus subdominios; sin punto inicial = solo ese host.
+permitir = .example.com
+puertos = 443
+max = 32
