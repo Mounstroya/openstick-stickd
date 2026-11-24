@@ -486,6 +486,10 @@ impl Vitrina for Compartir {
     fn id(&self) -> &'static str {
         ID
     }
+    // El iPhone debe poder salir del portal cautivo a Safari para la transferencia WebRTC.
+    fn ios_dejar_salir(&self) -> bool {
+        true
+    }
     fn nombre(&self) -> &'static str {
         "Compartir archivos"
     }

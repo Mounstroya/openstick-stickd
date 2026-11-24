@@ -242,9 +242,11 @@ fn guest_server(vitrinas: crate::Vitrinas, activa: Activa) {
                 invitados::sonda_exito(&host, &path)
             } else if invitados::sonda_directa(cliente) {
                 GuestResp::redirect(&format!("http://192.168.4.1{}", invitados::RUTA))
-            } else if es_sonda_apple(&host, &path) && ya_vio_la_pagina(cliente) {
-                // iPhone que ya vio la vitrina: "Success" hace que el botón diga «Listo» y
-                // que el teléfono se quede conectado (y pueda abrir Safari en 192.168.4.1)
+            } else if v.ios_dejar_salir() && es_sonda_apple(&host, &path) && ya_vio_la_pagina(cliente) {
+                // Solo las vitrinas que lo piden (p.ej. "Compartir archivos", donde el iPhone
+                // necesita salir del portal a Safari): "Success" hace que iOS deje tocar «Listo».
+                // Las vitrinas de mostrar NO lo usan: iOS cerraría el portal solo (con
+                // «Autenticación automática») y nunca se vería la página.
                 GuestResp::html("<HTML><HEAD><TITLE>Success</TITLE></HEAD><BODY>Success</BODY></HTML>")
             } else {
                 GuestResp::redirect("http://192.168.4.1/")

@@ -104,6 +104,13 @@ pub trait Vitrina: Send + Sync {
     fn admin_get(&self, _ruta: &str) -> Option<GuestResp> {
         None
     }
+    /// ¿Dejar que iOS cierre el portal cautivo con "Success" para que el invitado pueda salir
+    /// a Safari? Por defecto NO: las vitrinas de mostrar quieren que su página se quede visible
+    /// (si no, con «Autenticación automática» iOS cerraría el portal solo y no se vería nada).
+    /// Solo lo activa "Compartir archivos", donde el iPhone necesita salir del portal a Safari.
+    fn ios_dejar_salir(&self) -> bool {
+        false
+    }
     /// Se llama al activar / desactivar el modo (afluencia arranca/para la captura aquí).
     fn start(&self) {}
     fn stop(&self) {}
