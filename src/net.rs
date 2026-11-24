@@ -84,15 +84,18 @@ pub fn set_autoconnect(name: &str, yes: bool) {
     let _ = run("nmcli", &["con", "modify", name, "connection.autoconnect", if yes { "yes" } else { "no" }]);
 }
 
-/// Conexiones WiFi cliente guardadas (excluye el hotspot).
+/// Conexiones WiFi cliente guardadas (excluye el hotspot y cualquier red que emita el stick).
 pub fn saved_wifis() -> Vec<(String, String)> {
     let (_, out) = run("nmcli", &["-t", "-f", "NAME,TYPE", "con", "show"]);
     out.lines()
         .map(nm_fields)
         .filter(|f| f.len() >= 2 && f[1] == "802-11-wireless" && f[0] != "hotspot")
-        .map(|f| {
-            let ssid = run("nmcli", &["-g", "802-11-wireless.ssid", "con", "show", &f[0]]).1.trim().to_string();
-            (f[0].clone(), ssid)
+        .filter_map(|f| {
+            let (_, out) = run("nmcli", &["-g", "802-11-wireless.mode,802-11-wireless.ssid", "con", "show", &f[0]]);
+            // las redes que emite el propio stick (vitrina) no son redes a las que conectarse: al
+            // salir de una vitrina, el escaneo veía su propio SSID y la volvía a levantar
+            let (modo, ssid) = out.split_once('\n')?;
+            (modo.trim() != "ap").then(|| (f[0].clone(), ssid.trim().to_string()))
         })
         .collect()
 }
