@@ -457,11 +457,24 @@ details[open]>summary{{margin-bottom:12px}}details.chica>summary{{padding:8px 10
 .seg[hidden]{{display:none}}fieldset{{border:0;padding:0;margin:0 0 6px}}legend{{font-weight:700;padding:0;margin:6px 0 6px}}
 #modo[data-js] legend{{display:none}}#modo[data-js][data-lado=con] .g-vit,#modo[data-js][data-lado=vit] .g-con{{display:none}}
 fieldset>p{{margin:0 0 8px;font-size:14px}}
-@media(min-width:860px){{main{{max-width:980px;columns:2;column-gap:16px}}.card{{break-inside:avoid;overflow:hidden}}main>h1,.msg,.ancho{{column-span:all}}}}
-</style></head><body><main>
-<h1>OpenStick · UZ801</h1>
+.top{{position:sticky;top:0;z-index:5;background:var(--card);border-bottom:1px solid var(--bd);padding:11px 16px}}
+.top .wrap{{max-width:980px;margin:auto;display:flex;align-items:center;gap:12px}}
+.logo{{width:34px;height:34px;border-radius:9px;background:var(--acb);color:#fff;display:grid;place-items:center;font-size:17px;flex:none}}
+.brand{{font-weight:700;font-size:16px;line-height:1.15}}.top .sub{{color:var(--mut);font-size:13px}}
+.card>h2{{display:flex;align-items:center;gap:9px}}.card>h2::before{{content:"";width:4px;height:15px;border-radius:3px;background:var(--ac);flex:none}}
+.ancho h2{{margin-top:4px}}
+@media(min-width:860px){{
+ main{{max-width:980px;margin:auto;columns:2;column-gap:18px;padding:22px 16px 44px}}
+ .card{{break-inside:avoid;overflow:hidden;padding:18px;box-shadow:0 1px 3px #0000002e}}
+ .msg,.ancho,.hero{{column-span:all}}
+ .hero{{margin-bottom:18px;background:linear-gradient(180deg,var(--soft),var(--card))}}
+ .hero #st{{grid-template-columns:auto 1fr auto 1fr;gap:9px 22px}}
+}}
+</style></head><body>
+<header class=top><div class=wrap><span class=logo>◉</span><div><div class=brand>OpenStick · UZ801</div><div class=sub>Panel de administración</div></div></div></header>
+<main>
 {msg_html}
-<section class=card><h2>Estado</h2><dl id=st><dt>Cargando…</dt><dd></dd></dl></section>
+<section class="card hero"><h2>Estado</h2><dl id=st><dt>Cargando…</dt><dd></dd></dl></section>
 <section class=card><h2>Modo de trabajo</h2>
 <form method=post action=/modo id=modo data-lado={lado}>
 <div class=seg id=seg hidden><button type=button data-l=con aria-pressed=false>Conexión</button><button type=button data-l=vit aria-pressed=false>Vitrina</button></div>
