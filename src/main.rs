@@ -249,6 +249,8 @@ fn hotspot_has_clients() -> bool {
 fn one_time_setup() {
     let _ = util::run("nmcli", &["con", "modify", "lte", "ipv4.route-metric", "700", "ipv6.route-metric", "700"]);
     let _ = util::run("nmcli", &["con", "modify", "hotspot", "connection.autoconnect", "no", "connection.autoconnect-priority", "0"]);
+    // versiones anteriores podían dejarla en "yes", y NM la levantaba sola
+    net::set_autoconnect("vitrina", false);
     captive::firewall_off();
     captive::ap_down();
 }
@@ -310,6 +312,9 @@ fn main() {
 
     let mut leds = Leds::new();
     let mut applied: Option<Mode> = None;
+    // vitrina realmente prendida. No basta `applied`: ApplyMode (panel) lo borra y, sin esto, al
+    // salir de una vitrina por el panel nadie la apagaba y su AP se quedaba con el radio.
+    let mut encendida: Option<&'static str> = None;
     let mut no_net_since: Option<Instant> = None;
     let mut no_host_since: Option<Instant> = None;
     let mut last_config_exit: Option<Instant> = None;
@@ -350,21 +355,22 @@ fn main() {
 
         // Cambio de modo efectivo
         if applied != Some(eff) && !cfg {
-            if let Some(Mode::Vitrina(old)) = applied {
+            if let Some(old) = encendida.filter(|o| eff != Mode::Vitrina(o)) {
                 stop_vitrina(&vit, &activa, old);
-            } else if let Mode::Vitrina(_) = eff {
-                // venimos de un modo normal: nada que detener
+                encendida = None;
             }
             log(&format!("aplicando modo {}", eff.key()));
             apply_uplinks(eff, cfg);
             if let Mode::Vitrina(id) = eff {
                 start_vitrina(&vit, &activa, id);
+                encendida = Some(id);
             }
             applied = Some(eff);
             state.lock().unwrap().effective = eff;
         } else if cfg && applied.is_some_and(|a| matches!(a, Mode::Vitrina(_))) {
             // la vitrina se detuvo al entrar a configuración; al salir se re-aplica
             applied = None;
+            encendida = None;
         } else if let Mode::Vitrina(id) = eff {
             // el AP no levantó (radio ocupado, NM lento…): reintentar cada 30 s
             let needs_ap = vit_by_id(&vit, id).is_some_and(|v| v.usa_ap());
