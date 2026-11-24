@@ -457,6 +457,7 @@ details[open]>summary{{margin-bottom:12px}}details.chica>summary{{padding:8px 10
 .seg[hidden]{{display:none}}fieldset{{border:0;padding:0;margin:0 0 6px}}legend{{font-weight:700;padding:0;margin:6px 0 6px}}
 #modo[data-js] legend{{display:none}}#modo[data-js][data-lado=con] .g-vit,#modo[data-js][data-lado=vit] .g-con{{display:none}}
 fieldset>p{{margin:0 0 8px;font-size:14px}}
+@media(min-width:860px){{main{{max-width:980px;columns:2;column-gap:16px}}.card{{break-inside:avoid;overflow:hidden}}main>h1,.msg,.ancho{{column-span:all}}}}
 </style></head><body><main>
 <h1>OpenStick · UZ801</h1>
 {msg_html}
@@ -473,8 +474,8 @@ fieldset>p{{margin:0 0 8px;font-size:14px}}
 <form method=post action=/powerbank class=row><select name=valor style=flex:1>{pb_opts}</select><button>Guardar</button></form></section>
  <section class="card plegable" id=invitados><details{inv_open}><summary><span class=st><span class=h2>Internet para invitados</span><small class=mut>{inv_res}</small></span><span class=abrir></span></summary><div class=cuerpo>{inv_html}</div></details></section>
   {plugins_html}
-  <h2 style="margin:22px 0 4px">Vitrinas</h2>
-<p class=mut style="margin:0 0 10px">Toca una para configurarla. Para ponerla al aire elígela arriba, en «Modo de trabajo» → «Vitrina».</p>
+  <div class=ancho><h2 style="margin:22px 0 4px">Vitrinas</h2>
+<p class=mut style="margin:0 0 10px">Toca una para configurarla. Para ponerla al aire elígela arriba, en «Modo de trabajo» → «Vitrina».</p></div>
 {vit_cards}
 <section class=card><h2>Redes WiFi para tener internet</h2><ul>{saved}</ul>
 <form method=post action=/wifi>
