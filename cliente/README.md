@@ -24,12 +24,16 @@ No es para esquivar bloqueos ni límites de un operador. Un stick atiende a un s
 
 ## Instalar
 
-1. Compila (ver el README principal) y conecta el stick por USB.
+0. Stick recién grabado con la imagen OpenStick: pon tu llave SSH y corre `./cliente/preparar.sh`.
+   Regenera la llave SSH del equipo y el machine-id (la imagen trae **los mismos en todos los
+   sticks**), quita las contraseñas de fábrica y cambia la del hotspot.
+1. Compila (ver el README principal) y conecta el stick por USB (uno a la vez: todos usan la misma
+   MAC e IP por USB).
 2. `DOMINIOS=".operador.com" USUARIO=cliente-x TUNEL=10.9.0.2 HUB=10.9.0.1 ./cliente/instalar.sh`
 3. En el servidor, agrega la llave pública que imprime como `[Peer]`, con `AllowedIPs = <TUNEL>/32`.
 4. En el panel (`http://192.168.5.1`) guarda el WiFi del cliente (2.4 GHz) y elige **Cliente (proxy)**.
-5. Cambia la contraseña del hotspot de configuración, que viene con una conocida:
-   `nmcli con modify hotspot wifi-sec.psk <otra>`
+5. Si no usaste `preparar.sh`, cambia la contraseña del hotspot de configuración, que viene con una
+   conocida: `nmcli con modify hotspot wifi-sec.psk <otra>`
 
 Probar desde el servidor:
 

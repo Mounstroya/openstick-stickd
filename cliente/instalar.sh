@@ -23,7 +23,9 @@ BIN=${BIN:-../target/aarch64-unknown-linux-gnu/release/stickd}
 for ip in "$TUNEL" "$HUB"; do [[ $ip =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] || { echo "IP no válida: $ip"; exit 1; }; done
 [[ $PUERTO =~ ^[0-9]{2,5}$ && $PUERTOS =~ ^[0-9,]+$ && $USUARIO =~ ^[A-Za-z0-9_-]+$ ]] || { echo "PUERTO, PUERTOS o USUARIO no válidos"; exit 1; }
 [ -f "$BIN" ] || { echo "Falta compilar: $BIN"; exit 1; }
-S=(ssh -i "$LLAVE" -o ConnectTimeout=8 "$STICK")
+# SSH_OPC: opciones extra de ssh/scp, p. ej. "-o UserKnownHostsFile=$HOME/stick2_known_hosts"
+read -r -a OPC <<< "${SSH_OPC:-}"
+S=(ssh "${OPC[@]}" -i "$LLAVE" -o IdentitiesOnly=yes -o ConnectTimeout=8 "$STICK")
 
 T=$(mktemp -d); trap 'rm -rf "$T"' EXIT; chmod 700 "$T"
 CLAVE=$(head -c 24 /dev/urandom | base64 | tr -d '/+=')
@@ -33,7 +35,7 @@ sed -e "s/@HUB@/$HUB/g" -e "s/@PUERTO@/$PUERTO/g" guard.nft > "$T/cliente-guard.
 cp stickd-proxy.service stickd-cliente-guard.service "$T/"; cp "$BIN" "$T/stickd"
 
 echo "==> Copiando"
-R=$("${S[@]}" 'mktemp -d'); scp -q -i "$LLAVE" "$T"/* "$STICK:$R/"
+R=$("${S[@]}" 'mktemp -d'); scp -q "${OPC[@]}" -i "$LLAVE" -o IdentitiesOnly=yes "$T"/* "$STICK:$R/"
 
 echo "==> Instalando"
 "${S[@]}" "sudo R=$R TUNEL=$TUNEL HUB=$HUB HUB_PUBKEY='${HUB_PUBKEY:-}' HUB_ENDPOINT='${HUB_ENDPOINT:-}' bash -s" <<'R'

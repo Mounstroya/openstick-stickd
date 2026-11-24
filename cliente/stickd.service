@@ -1,0 +1,13 @@
+[Unit]
+Description=stickd - gestor de modos OpenStick (USB > WiFi > LTE > configuracion)
+After=NetworkManager.service ModemManager.service
+Wants=NetworkManager.service
+
+[Service]
+ExecStart=/usr/local/sbin/stickd
+Restart=always
+RestartSec=3
+MemoryMax=64M
+
+[Install]
+WantedBy=multi-user.target
