@@ -267,9 +267,11 @@ fn guest_server(vitrinas: crate::Vitrinas, activa: Activa) {
     }
 }
 
-/// IPs que ya cargaron la página de entrada de la vitrina (para la sonda de Apple), 1 h.
+/// IPs que ya cargaron la página de entrada de la vitrina (para la sonda de Apple).
+/// Ventana corta: solo para que, tras ver la página, iOS deje tocar «Listo» y quedarse
+/// conectado. Si fuera larga (p.ej. 1 h), al reconectar el portal ya no reaparecería.
 static VISTOS: Mutex<Option<std::collections::HashMap<IpAddr, std::time::Instant>>> = Mutex::new(None);
-const VISTO_DURA: std::time::Duration = std::time::Duration::from_secs(3600);
+const VISTO_DURA: std::time::Duration = std::time::Duration::from_secs(120);
 
 fn marcar_visto(ip: IpAddr) {
     let mut g = VISTOS.lock().unwrap();
